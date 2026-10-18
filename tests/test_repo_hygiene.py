@@ -20,6 +20,7 @@ FORBIDDEN = {
     "home directory path": "/home/" + "[a-z]{1,12}" + "/bin/",
     "internal network drive": "[Zz]" + r":\\[wW]ork",
     "internal nas host": "zt" + "-nas",
+    "local absolute file link": "file:" + r"///[A-Za-z]:",
 }
 
 SKIPPED_DIRS = {".git", "__pycache__", ".pytest_cache", "logs"}

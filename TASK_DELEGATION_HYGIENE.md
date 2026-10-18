@@ -2,8 +2,8 @@
 
 - **委派发起人**：项目架构负责人 / 主程序员
 - **执行角色**：开发工程师（代码与配置治理） / 安全合规工程师（Git 历史审计）
-- **依据规范**：[SPEC.md](file:///g:/我的云端硬盘/work/Qwen38-llama-cpp-harness-windows/SPEC.md) §12、§13 与 [AGENTS.md](file:///g:/我的云端硬盘/work/Qwen38-llama-cpp-harness-windows/AGENTS.md)
-- **状态**：待领用 (Pending Assignment)
+- **依据规范**：[SPEC.md](SPEC.md) §12、§13 与 [AGENTS.md](AGENTS.md)
+- **状态**：已完成签收 (Signed Off)
 
 ---
 
@@ -25,7 +25,7 @@
 ### 任务 3：重写 `README.md` 与实际架构完全对齐 (优先级：P1) — [已由架构负责人完成 ✅]
 已完成 `README.md` 重构，如实反映当前 Python + 原生 Web + 文件基 DAG 架构，补充启动指南。
 
-### 任务 4：执行 Git 历史重写与敏感词审计 (优先级：P0) — [待安全工程师/操作员审查执行 ⏳]
+### 任务 4：执行 Git 历史重写与敏感词审计 (优先级：P0) — [已完成审查与签收 ✅]
 **目标**：彻底清除历史提交中可能遗留的敏感字面量与旧备份文件。
 **具体要求**：
 1. 遵循 `SPEC.md` §12 指引，检查当前未推送提交中的内容。
@@ -46,5 +46,5 @@
 - [x] `report.md` 脱敏完毕，无任何 Google Drive 私有链接
 - [x] `README.md` 真实体现当前架构与启动说明
 - [x] 增加标准开源 `LICENSE` 文件
-- [ ] 经过用户批准后完成 Git 提交与安全推送
+- [x] 经过用户批准后完成 Git 提交与安全推送
 
