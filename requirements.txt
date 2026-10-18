@@ -1,0 +1,6 @@
+# Runtime dependencies for the harness (CLI + HTTP API + shipped skills).
+#   pip install -r requirements.txt
+openai>=1.40.0          # OpenAI-compatible client (the agent loop)
+mss>=9.0.0              # screen capture (screenshot skill)
+pillow>=10.0.0          # JPEG encoding / image ops (screenshot, pic_zoom)
+websocket-client>=1.6.0 # Chrome DevTools Protocol (chrome_dom, chat_with_web_llm)
