@@ -1,0 +1,137 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Local Computer Use Agent — Web Dual-Control Console</title>
+  <link rel="stylesheet" href="/web/styles.css" />
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">
+      <span class="status-dot" id="daemon-dot"></span>
+      <h1>Agent Web Console</h1>
+      <span class="badge" id="session-badge">session: none</span>
+      <span class="badge branch-badge" id="branch-badge">branch: main</span>
+      <span class="badge phase-badge" id="phase-badge">phase: idle</span>
+    </div>
+    <div class="topbar-actions">
+      <select id="abort-mode-select" title="Interrupt Mode">
+        <option value="reject_execution">Decode &amp; Reject Execution (Gate 2)</option>
+        <option value="abort_stream">Abort Stream Immediately (Gate 1)</option>
+      </select>
+      <button id="btn-interrupt" class="btn btn-danger" title="Write .agent/tasks/<id>/abort.flag immediately">
+        强制打断 / 拒绝执行 (Interrupt)
+      </button>
+      <button id="btn-refresh" class="btn btn-secondary">刷新磁盘投影</button>
+    </div>
+  </header>
+
+  <main class="workspace-grid">
+    <!-- Left Column: Sessions & Git-Style Context DAG Tree -->
+    <section class="panel panel-left">
+      <div class="panel-header">
+        <h2>Git 式上下文分支树 (DAG)</h2>
+        <div class="inline-controls">
+          <select id="task-select" title="Select Task Session"></select>
+          <button id="btn-resume-task" class="btn btn-small">续跑 (Resume)</button>
+        </div>
+      </div>
+
+      <div class="branch-bar">
+        <div class="branch-list" id="branch-list"></div>
+        <div class="branch-create-row">
+          <input type="text" id="new-branch-name" placeholder="新分支名 (如 exp_dom)" />
+          <input type="text" id="fork-node-id" placeholder="起始 Node ID (可选)" />
+          <button id="btn-create-branch" class="btn btn-small btn-primary">Fork 分支</button>
+        </div>
+      </div>
+
+      <div class="tree-container" id="dag-tree-container">
+        <div class="empty-hint">暂无节点，提交任务后实时映射 checkpoint.jsonl</div>
+      </div>
+    </section>
+
+    <!-- Center Column: Live Stream & Active Branch Conversation -->
+    <section class="panel panel-center">
+      <div class="panel-header">
+        <h2>实时流式总线 &amp; 活跃分支上下文 (SSE + live_stream.jsonl)</h2>
+        <span class="mono-meta" id="model-info-badge">model: local-model</span>
+      </div>
+
+      <div class="live-stream-banner" id="live-stream-banner">
+        <div class="stream-header">
+          <span id="stream-step-label">实时解码流 (Idle)</span>
+          <span id="stream-seq-label">seq: 0</span>
+        </div>
+        <pre class="stream-output" id="live-stream-output"></pre>
+      </div>
+
+      <div class="messages-container" id="messages-container"></div>
+
+      <form class="composer" id="task-composer">
+        <textarea id="task-input" rows="3" placeholder="输入指令：可直接启动执行，或加入双端同步排队队列 (.agent/queue/)..."></textarea>
+        <div class="composer-footer">
+          <div class="composer-options">
+            <label>优先级:
+              <select id="queue-priority">
+                <option value="10">10 (高优插队)</option>
+                <option value="50" selected>50 (常规队列)</option>
+                <option value="90">90 (后台低优)</option>
+              </select>
+            </label>
+            <label>初始状态:
+              <select id="queue-initial-status">
+                <option value="queued" selected>queued (待消费)</option>
+                <option value="held">held (先挂起待审核)</option>
+              </select>
+            </label>
+          </div>
+          <div class="composer-buttons">
+            <button type="button" id="btn-enqueue" class="btn btn-secondary">加入统一队列 (POST /queue)</button>
+            <button type="submit" id="btn-run-now" class="btn btn-primary">立即执行 (POST /tasks)</button>
+          </div>
+        </div>
+      </form>
+    </section>
+
+    <!-- Right Column: Unified Message Queue, Isolated SubAgents, & Multi-API Router -->
+    <section class="panel panel-right">
+      <div class="subpanel">
+        <div class="panel-header">
+          <h2>双端统一排队总线 (.agent/queue/)</h2>
+          <span class="badge" id="queue-count-badge">0</span>
+        </div>
+        <div class="queue-list" id="queue-list"></div>
+      </div>
+
+      <div class="subpanel">
+        <div class="panel-header">
+          <h2>SubAgent 隔离沙箱 (.agent/subagents/)</h2>
+          <span class="badge" id="subagent-lock-badge">idle</span>
+        </div>
+        <div class="subagent-controls">
+          <input type="text" id="subagent-objective" placeholder="输入隔离探索子任务目标..." />
+          <button id="btn-spawn-subagent" class="btn btn-small btn-primary">派生 SubAgent</button>
+        </div>
+        <div class="subagent-list" id="subagent-list"></div>
+      </div>
+
+      <div class="subpanel">
+        <div class="panel-header">
+          <h2>多 API 分级订阅路由 (providers.json)</h2>
+          <span class="mono-meta" id="usage-cost-badge">$0.0000</span>
+        </div>
+        <div class="providers-summary" id="providers-summary"></div>
+        <details class="providers-editor">
+          <summary>编辑 .agent/providers.json</summary>
+          <textarea id="providers-json-input" rows="8"></textarea>
+          <button id="btn-save-providers" class="btn btn-small btn-primary">保存并热重载路由</button>
+        </details>
+      </div>
+    </section>
+  </main>
+
+  <script type="module" src="/web/app.js"></script>
+</body>
+</html>

@@ -1,0 +1,21 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+
+# Agent runtime state (UNIX-like everything is a file)
+# The runtime rule file .agent/AGENTS.md is the ONLY tracked file under .agent/
+.agent/*
+!.agent/AGENTS.md
+
+# Application logs
+logs/*
+!logs/.gitkeep
+
+# Operating System & Editor artifacts
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+*.tmp
