@@ -183,7 +183,11 @@ class Agent:
         if self.goal_mode:
             base_system += "\n\nGOAL MODE ACTIVE: You must continue working until the goal is fully achieved. Put TASK_DONE only when complete."
 
-        self.context = ContextManager(base_system, max_screenshots=3)
+        self.context = ContextManager(
+            base_system,
+            max_screenshots=6,
+            retain_screenshots=2,
+        )
         self.current_task_id: str | None = None
         self._active_step_id: str = ""
 
@@ -376,15 +380,12 @@ class Agent:
             messages=self.context.as_list(),
             tools=self.tools,
             tool_choice=tool_choice,
-            temperature=1.0,
+            temperature=0.2,
             top_p=0.95,
             max_tokens=gen_cap,
             stream=True,
             extra_body=self.config.chat_extra,
         )
-        if tool_choice == "none":
-            kwargs.pop("tools", None)
-            kwargs.pop("tool_choice", None)
         last_err: Exception | None = None
         for attempt in range(1, 9):
             try:
@@ -534,23 +535,34 @@ class Agent:
             choices=[SimpleNamespace(message=message, finish_reason=finish_reason)]
         )
 
+    _LEDGER_INSTRUCTION = (
+        "你是长程任务的事实账本压缩器（Fact Ledger Compactor）。把下面的对话历史压缩为一份"
+        "结构化中文 Markdown 事实账本。必须输出且只输出以下五个编号小节；"
+        "信息密度优先，保留具体文件路径、命令、报错原文与数字，不要寒暄：\n"
+        "1. 核心目标与进度\n"
+        "2. 已验证事实与环境基线\n"
+        "3. 已修改文件清单\n"
+        "4. 被否决方案与操作员红线（永久保留）\n"
+        "5. 待完成子目标与下一步行动\n"
+    )
+
     def _summarize(self, messages: list[dict[str, Any]]) -> str:
-        """Ask the configured compactor model for a compact Chinese history summary."""
+        """Ask the configured compactor model for a five-section Chinese fact ledger."""
         history = json.dumps(messages, ensure_ascii=False, default=str)
-        prompt = (
-            "Summarize the following conversation history in Chinese, preserving key "
-            "facts, decisions, and file paths:\n"
-            f"{history}"
-        )
+        prompt = f"{self._LEDGER_INSTRUCTION}\n对话历史（JSON）：\n{history}"
         comp_cfg = self.compactor_config or self.config
         comp_client = self.compactor_client if (self.compactor_client is not None and comp_cfg is not self.config) else self.client
+        extra_body = dict(comp_cfg.chat_extra or {})
+        template_kwargs = dict(extra_body.get("chat_template_kwargs") or {})
+        template_kwargs["enable_thinking"] = False
+        extra_body["chat_template_kwargs"] = template_kwargs
         response = comp_client.chat.completions.create(
             model=comp_cfg.model,
             messages=[{"role": "user", "content": prompt}],
             temperature=0.2,
-            max_tokens=512,
+            max_tokens=2048,
             stream=False,
-            extra_body=comp_cfg.chat_extra,
+            extra_body=extra_body,
         )
         message = response.choices[0].message
         summary = (getattr(message, "content", None) or "").strip()
@@ -707,10 +719,34 @@ class Agent:
 
                 for tc in msg.tool_calls:
                     name = tc.function.name
+                    raw_arguments = tc.function.arguments or "{}"
                     try:
-                        args = json.loads(tc.function.arguments or "{}")
-                    except json.JSONDecodeError:
-                        args = {}
+                        args = json.loads(raw_arguments)
+                    except json.JSONDecodeError as json_err:
+                        diag_msg = (
+                            f"error: JSONDecodeError in tool '{name}' arguments at char {json_err.pos} "
+                            f"(line {json_err.lineno}, column {json_err.colno}): {json_err.msg}. "
+                            f"Raw arguments received: {raw_arguments[:400]!r}. "
+                            "The tool was NOT executed. Fix the JSON syntax and call the tool again."
+                        )
+                        self.logger.warning(f"<- [json-error] {diag_msg}")
+                        with self._scoped_persistence():
+                            self.context.append(
+                                {"role": "tool", "tool_call_id": tc.id, "content": diag_msg},
+                                meta={"step_id": step_id, "json_error": True},
+                            )
+                        self.observer.emit(
+                            self.current_task_id,
+                            "tool_rejected",
+                            {
+                                "tool": name,
+                                "tool_call_id": tc.id,
+                                "reason": f"JSONDecodeError at char {json_err.pos}",
+                            },
+                            step_id=step_id,
+                            tasks_root=self._tasks_root,
+                        )
+                        continue
 
                     # Gate 2: Pre-Dispatch Hard Rejection Gate
                     current_abort = self._is_step_rejected() or abort_info
@@ -1021,7 +1057,13 @@ class Agent:
             raise
 
     def run_task(self, user_text: str, task_id: str | None = None) -> str:
-        """Run one task; the caller may pin the task id (used by the HTTP API)."""
+        """Run one task; the caller may pin the task id (used by the HTTP API).
+
+        Every fresh (non-resume) task starts from a clean context: the message
+        cache is reset before binding so no previous task's history can leak
+        into this task's checkpoint. GOAL.md is materialized before binding so
+        the root system node is complete from the very first disk write.
+        """
         self.validator.reset()
         self.last_aborted = False
         with self._scoped_persistence():
@@ -1031,13 +1073,14 @@ class Agent:
                     set_current_session(self.current_task_id)
                 except Exception:
                     pass
+            self.context.clear_task()
             save_status(self.current_task_id, "running")
-            self.context.bind_task(self.current_task_id, sync_initial=True)
 
         try:
             if self.goal_mode and not GOAL_PATH.exists():
                 self.ensure_goal_doc(user_text)
             with self._scoped_persistence():
+                self.context.bind_task(self.current_task_id, sync_initial=True)
                 self.context.append({"role": "user", "content": user_text})
             final = self.step_loop()
         except Exception as e:

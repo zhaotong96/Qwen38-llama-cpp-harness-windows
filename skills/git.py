@@ -1,5 +1,6 @@
 import subprocess
 from core.models import ROOT
+from core.tools import execution_aborted
 
 DESCRIPTION = "Execute git operations (status, add, commit, diff, log)."
 PARAMETERS = {
@@ -11,6 +12,8 @@ PARAMETERS = {
     },
     "required": ["action"],
 }
+
+GIT_TIMEOUT = 60
 
 
 def HANDLER(action: str, message: str = "", target: str = "") -> str:
@@ -33,8 +36,30 @@ def HANDLER(action: str, message: str = "", target: str = "") -> str:
     else:
         return f"error: unknown git action {action}"
 
+    if execution_aborted():
+        return (
+            "[EXECUTION_INTERRUPTED_AND_IGNORED] Tool 'git' was interrupted by operator; "
+            "its output and side-effects have been ignored."
+        )
+
     try:
-        r = subprocess.run(cmd, capture_output=True, text=True, cwd=str(ROOT), encoding="utf-8", errors="replace")
-        return f"exit={r.returncode}\n{(r.stdout or '') + (r.stderr or '')}"
+        r = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            cwd=str(ROOT),
+            encoding="utf-8",
+            errors="replace",
+            timeout=GIT_TIMEOUT,
+        )
+    except subprocess.TimeoutExpired:
+        return f"error: git action timed out after {GIT_TIMEOUT}s"
     except Exception as e:
         return f"error: {e}"
+
+    if execution_aborted():
+        return (
+            "[EXECUTION_INTERRUPTED_AND_IGNORED] Tool 'git' was interrupted by operator; "
+            "its output and side-effects have been ignored."
+        )
+    return f"exit={r.returncode}\n{(r.stdout or '') + (r.stderr or '')}"

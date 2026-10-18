@@ -467,10 +467,32 @@ def _extract_screenshot_path(message: dict[str, Any], seq: int) -> str:
     return f".agent/screen_{seq:03d}.jpg"
 
 
+def split_for_compaction(messages: list[dict[str, Any]], keep_recent: int) -> int:
+    """Return the fold split index with recent[0] pinned to a ``user`` boundary.
+
+    Starting the recent window on a user turn keeps tool-call pairing intact
+    (no dangling ``tool`` node without its parent ``assistant`` tool_calls).
+    Falls back to the last user turn before the split, then to the raw split.
+    """
+    total = len(messages)
+    keep = max(0, int(keep_recent))
+    start = max(0, total - keep)
+    if start >= total:
+        return start
+    for index in range(start, total):
+        if messages[index].get("role") == "user":
+            return index
+    for index in range(start - 1, -1, -1):
+        if messages[index].get("role") == "user":
+            return index
+    return start
+
+
 def build_branch_context(
     task_id: str,
     branch: str | None = None,
     max_screenshots: int | None = None,
+    retain_screenshots: int | None = None,
     heal_dangling_tool_calls: bool = False,
 ) -> list[dict[str, Any]]:
     """Build the linear OpenAI message list for the target branch.
@@ -519,13 +541,17 @@ def build_branch_context(
             if _is_screenshot_message(msg):
                 seq += 1
                 screenshot_positions.append((idx, _extract_screenshot_path(msg, seq)))
-        while len(screenshot_positions) > max_keep:
-            old_idx, path = screenshot_positions.pop(0)
-            old_msg = messages[old_idx]
-            messages[old_idx] = {
-                "role": old_msg.get("role", "user"),
-                "content": f"[screenshot removed, file at {path}]",
-            }
+        if len(screenshot_positions) > max_keep:
+            target_keep = max_keep
+            if retain_screenshots is not None:
+                target_keep = min(max(0, int(retain_screenshots)), max_keep)
+            while len(screenshot_positions) > target_keep:
+                old_idx, path = screenshot_positions.pop(0)
+                old_msg = messages[old_idx]
+                messages[old_idx] = {
+                    "role": old_msg.get("role", "user"),
+                    "content": f"[screenshot removed, file at {path}]",
+                }
 
     return messages
 
@@ -782,13 +808,36 @@ def checkout_branch(task_id: str, branch_name: str) -> dict[str, Any]:
     }
 
 
+def _node_preview(node: dict[str, Any], limit: int = 60) -> str:
+    """Deterministic one-line preview of a DAG node for the archived-node index table."""
+    content = node.get("content")
+    if isinstance(content, str) and content.strip():
+        text = " ".join(content.split())
+        return text[:limit] + ("…" if len(text) > limit else "")
+    if node.get("tool_calls"):
+        names = [
+            str(tc.get("function", {}).get("name", "?"))
+            for tc in node.get("tool_calls") or []
+            if isinstance(tc, dict)
+        ]
+        return "[tool_calls: " + ", ".join(names) + "]"
+    if isinstance(content, list):
+        return "[multimodal observation]"
+    return "[" + str(node.get("role", "?")) + " message]"
+
+
 def compact_branch_dag(
     task_id: str,
     summary_text: str,
     keep_recent: int = 6,
     branch: str | None = None,
 ) -> dict[str, Any] | None:
-    """Non-destructively compact a branch in checkpoint.jsonl without altering other branches."""
+    """Non-destructively compact a branch in checkpoint.jsonl without altering other branches.
+
+    The recent window is re-anchored onto a ``user`` node (no dangling ``tool``
+    node) and a deterministic archived-node index table (section 6) is appended
+    to the ledger so any folded node stays addressable via read_checkpoint_node.
+    """
     target_branch = branch or get_current_branch(task_id)
     chain = build_branch_nodes(task_id, target_branch)
     if len(chain) <= 1:
@@ -797,19 +846,25 @@ def compact_branch_dag(
     keep_recent = max(0, int(keep_recent))
     root_node = chain[0]
     conversation = chain[1:]
-    if keep_recent:
-        old_nodes = conversation[:-keep_recent]
-        recent_nodes = conversation[-keep_recent:]
-    else:
-        old_nodes = conversation
-        recent_nodes = []
+    split = split_for_compaction(conversation, keep_recent)
+    old_nodes = conversation[:split]
+    recent_nodes = conversation[split:]
 
     if not old_nodes:
         return None
 
+    index_lines = ["6. 已归档原始 DAG 节点索引表（可用 read_checkpoint_node 按 node_id 回溯原文）"]
+    for node in old_nodes:
+        clean = strip_dag_envelope(node)
+        char_count = len(json.dumps(clean, ensure_ascii=False, default=str))
+        index_lines.append(
+            f"- {node.get('id')} ({node.get('role', '?')}): {_node_preview(clean)} [{char_count} chars]"
+        )
+    summary_content = summary_text.rstrip() + "\n\n" + "\n".join(index_lines)
+
     summary_msg = {
         "role": "system",
-        "content": f"[Context Summary]\n{summary_text}",
+        "content": f"[Context Summary]\n{summary_content}",
     }
     compaction_node = append_dag_node(
         task_id,
@@ -842,6 +897,7 @@ def compact_branch_dag(
         "head_node_id": curr_parent,
         "branch": target_branch,
         "summarized_up_to": old_nodes[-1]["id"],
+        "summary_content": summary_content,
     }
 
 

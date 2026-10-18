@@ -4,6 +4,7 @@ from __future__ import annotations
 import unittest
 
 from core import persistence
+from core import tools as tools_mod
 from tests.support import IsolatedCase
 
 
@@ -62,6 +63,75 @@ class ListTasksTests(IsolatedCase):
 
     def test_empty_root(self):
         self.assertEqual(persistence.list_tasks(), [])
+
+
+class CompactionBoundaryTests(IsolatedCase):
+    """Fold split re-anchors on a user node; archived nodes stay addressable."""
+
+    def _seed_task(self, task_id: str) -> None:
+        messages = [
+            {"role": "system", "content": "sys"},
+            {"role": "user", "content": "u1"},
+            {
+                "role": "assistant",
+                "content": "a1",
+                "tool_calls": [
+                    {
+                        "id": "c1",
+                        "type": "function",
+                        "function": {"name": "mouse", "arguments": "{}"},
+                    }
+                ],
+            },
+            {"role": "tool", "tool_call_id": "c1", "content": "t1"},
+            {"role": "assistant", "content": "a2"},
+            {"role": "user", "content": "u2"},
+        ]
+        persistence.save_checkpoint(task_id, messages)
+
+    def test_recent_window_starts_on_user_and_indexes_archived_nodes(self):
+        task_id = "compact_boundary"
+        self._seed_task(task_id)
+        nodes_before, _ = persistence.load_dag_nodes(task_id)
+        id_of_a1 = next(n["id"] for n in nodes_before if n.get("content") == "a1")
+
+        result = persistence.compact_branch_dag(task_id, "摘要文本", keep_recent=2)
+        self.assertIsNotNone(result)
+        self.assertIn("summary_content", result)
+        self.assertIn(id_of_a1, result["summary_content"])
+
+        rebuilt = persistence.build_branch_context(task_id)
+        self.assertEqual(rebuilt[0]["role"], "system")
+        self.assertIn("[Context Summary]", rebuilt[1]["content"])
+        self.assertIn("6. 已归档原始 DAG 节点索引表", rebuilt[1]["content"])
+        self.assertIn(id_of_a1, rebuilt[1]["content"])
+        self.assertEqual(rebuilt[2]["role"], "user")
+        self.assertEqual(rebuilt[2]["content"], "u2")
+
+    def test_read_checkpoint_node_skill_recovers_folded_node(self):
+        task_id = "compact_recall"
+        self._seed_task(task_id)
+        nodes_before, _ = persistence.load_dag_nodes(task_id)
+        id_of_a1 = next(n["id"] for n in nodes_before if n.get("content") == "a1")
+
+        persistence.compact_branch_dag(task_id, "折叠摘要", keep_recent=2)
+
+        skill = next(
+            s for s in tools_mod.discover_skills() if s["name"] == "read_checkpoint_node"
+        )
+        out = skill["module"].run({"node_id": id_of_a1}, {"parent_task_id": task_id})
+        self.assertIn("a1", out)
+        self.assertNotIn("parent_id", out)
+        self.assertNotIn("branch", out)
+
+    def test_read_checkpoint_node_skill_handles_missing_node(self):
+        skill = next(
+            s for s in tools_mod.discover_skills() if s["name"] == "read_checkpoint_node"
+        )
+        self._seed_task("compact_missing")
+        out = skill["module"].run({"node_id": "n_404"}, {"parent_task_id": "compact_missing"})
+        self.assertTrue(out.startswith("error:"))
+        self.assertIn("not found", out)
 
 
 if __name__ == "__main__":
