@@ -97,14 +97,28 @@ def atomic_write_text(target_path: Path, content: str, encoding: str = "utf-8") 
     return target_path
 
 
+def _read_text_tolerant(path: Path) -> str | None:
+    """Read a text file, returning None when it is missing or mid-replacement.
+
+    State files are swapped in via ``atomic_write_text`` (os.replace) while the
+    HTTP API and the agent loop read them concurrently; a reader may observe a
+    file that has just been renamed away. Callers treat None as "absent".
+    """
+    try:
+        return Path(path).read_text(encoding="utf-8")
+    except OSError:
+        return None
+
+
 # --- Singleton Session Pointer (.agent/current_session) -------------------
 
 def get_current_session() -> str | None:
     """Read the active session task_id from .agent/current_session."""
     path = current_session_file()
-    if not path.is_file():
+    raw = _read_text_tolerant(path)
+    if raw is None:
         return None
-    raw = path.read_text(encoding="utf-8").strip()
+    raw = raw.strip()
     if not raw or not _TASK_ID_PATTERN.fullmatch(raw):
         return None
     return raw
@@ -202,10 +216,9 @@ def _generate_node_id(seq: int) -> str:
 
 def get_current_branch(task_id: str) -> str:
     branch_file = _task_directory(task_id) / CURRENT_BRANCH_FILE
-    if branch_file.is_file():
-        val = branch_file.read_text(encoding="utf-8").strip()
-        if val and _TASK_ID_PATTERN.fullmatch(val):
-            return val
+    val = (_read_text_tolerant(branch_file) or "").strip()
+    if val and _TASK_ID_PATTERN.fullmatch(val):
+        return val
     return DEFAULT_BRANCH
 
 
@@ -218,10 +231,9 @@ def get_branch_head(task_id: str, branch: str | None = None) -> str | None:
     target_branch = branch or get_current_branch(task_id)
     _validate_identifier(target_branch, "branch name")
     ref_file = _task_directory(task_id) / BRANCHES_DIR / target_branch
-    if ref_file.is_file():
-        val = ref_file.read_text(encoding="utf-8").strip()
-        if val:
-            return val
+    val = (_read_text_tolerant(ref_file) or "").strip()
+    if val:
+        return val
     return None
 
 
@@ -237,8 +249,8 @@ def list_branches(task_id: str) -> dict[str, str]:
         return {}
     result: dict[str, str] = {}
     for p in sorted(branches_dir.iterdir()):
-        if p.is_file() and _TASK_ID_PATTERN.fullmatch(p.name):
-            head = p.read_text(encoding="utf-8").strip()
+        if _TASK_ID_PATTERN.fullmatch(p.name):
+            head = (_read_text_tolerant(p) or "").strip()
             if head:
                 result[p.name] = head
     return result
@@ -250,8 +262,8 @@ def list_tags(task_id: str) -> dict[str, str]:
         return {}
     result: dict[str, str] = {}
     for p in sorted(tags_dir.iterdir()):
-        if p.is_file() and _TASK_ID_PATTERN.fullmatch(p.name):
-            node_id = p.read_text(encoding="utf-8").strip()
+        if _TASK_ID_PATTERN.fullmatch(p.name):
+            node_id = (_read_text_tolerant(p) or "").strip()
             if node_id:
                 result[p.name] = node_id
     return result
@@ -334,15 +346,18 @@ def load_dag_nodes(task_id: str) -> tuple[list[dict[str, Any]], dict[str, Any]] 
     """
     task_dir = _task_directory(task_id)
     checkpoint = task_dir / CHECKPOINT_FILE
-    if not checkpoint.is_file():
-        return None
 
     nodes: list[dict[str, Any]] = []
     metadata: dict[str, Any] = {}
     had_legacy_nodes = False
     msg_index = 0
 
-    with checkpoint.open("r", encoding="utf-8") as handle:
+    try:
+        handle = checkpoint.open("r", encoding="utf-8")
+    except OSError:
+        return None
+
+    with handle:
         for line_number, line in enumerate(handle, start=1):
             if not line.strip():
                 continue
@@ -867,9 +882,7 @@ def save_status(task_id: str, status: str) -> Path:
 def load_status(task_id: str) -> str | None:
     """Read the lifecycle marker word, or return ``None`` when absent."""
     status_file = _task_directory(task_id) / STATUS_FILE
-    if not status_file.is_file():
-        return None
-    return status_file.read_text(encoding="utf-8").strip() or None
+    return (_read_text_tolerant(status_file) or "").strip() or None
 
 
 def generate_task_id() -> str:
@@ -893,7 +906,10 @@ def list_tasks() -> list[dict[str, Any]]:
         if loaded is None:
             continue
         messages, _ = loaded
-        created = datetime.fromtimestamp(checkpoint.stat().st_mtime).isoformat(timespec="seconds")
+        try:
+            created = datetime.fromtimestamp(checkpoint.stat().st_mtime).isoformat(timespec="seconds")
+        except OSError:
+            continue
         tasks.append(
             {
                 "id": task_directory.name,

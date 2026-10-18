@@ -1,32 +1,17 @@
-# 安全合规绿灯签收回执
+Phase 5B 前端联调验收完成，汇报如下：
 
-**审计人**：安全合规工程师 | **日期**：2026-10-18 | **基准**：SPEC.md §12、TASK_DELEGATION_HYGIENE.md
+**验收结果（T1–T7 全部通过，真实 Chrome 155 + CDP 实测，截图存证于 `%TEMP%\opencode\webui-e2e\shots\`）**
+- 加载零 Console 报错 / 零 HTTP 失败；三栏 grid 340/1fr/380，无页面横滚。
+- DAG：七类角色（system/user/assistant/reasoning/tool_calls/tool/compaction）配色+图例；点击高亮（SSE 重渲染后保持）；展开/收起详情；checkout/fork 实测落盘生效。
+- SSE 打字机：逐帧增长（9 growth events）、seq 去重、chars≈tokens 计数、清空按钮；Gate1 打断流冻结、`(REJECTED)` 相位、abort 归档。
+- 队列：入队即时上屏（并发刷新竞态已消除）；hold/resume/edit/cancel 四操作与 `.agent/queue/` 磁盘逐项一致；全部操作有瞬时 notice 反馈。
+- 响应式：1680/1440/1280/1100/980 五档 + DSR1.5，无溢出；980 单列堆叠。
+- 红线守约：`web/` 仅 5 个原生文件，无任何构建物；全部状态经 REST/SSE 与磁盘对照。
 
-**结论：CONDITIONAL PASS（绿灯，附 1 项发布前行动项）** — 本地工作区已达零敏感外泄基线；因按您指示暂缓提交，公开远端 `3f9156b` 上 `TASK_DELEGATION_HYGIENE.md:5` 的本地路径字面量，在修复被推送前仍处于公开状态。
+**变更**：重写 `web/app.js`、`web/tree_view.js`、`web/styles.css`、`web/queue_panel.js`、`web/index.html`；`TASK_DEV_FRONTEND.md` 清单已打勾并附"五、验收回执（前端）"；`Ran 107 tests OK`。
 
-**审计证据（全部可复现）**
-
-| # | 检查项 | 结果 |
-|---|---|---|
-| 1 | `.gitignore` 运行时隔离（任务快照/排队/截图/锁/归档/凭据） | 通过：`git check-ignore -v` 逐项验证 `.agent/*` 全阻断，仅 `AGENTS.md` 可跟踪 |
-| 2 | 隐私门禁 | 通过：`python tests/test_repo_hygiene.py` → OK；全量回归 107/107 OK |
-| 3 | SPEC §12 扫描（私网 IP / 分享 ID / 内网域 / 家目录） | 通过：`git grep` 零命中 |
-| 4 | report/README/SPEC 外链 | 通过：`drive.google`、`file/d/`、`folders/` 全零命中；URL 均为回环地址/公共徽章 |
-| 5 | Git 历史与远端 | 通过：全部可达提交（`aa0f695→6968cb0→3f9156b`）全模式扫描零真实命中；旧脏提交 `3bb63a5` 在对象库与远端均不存在（reflog 证明为清理后全新 clone 谱系）；`origin/main == 3f9156b` 无额外分支/标签 |
-| 6 | 发现并处置 | `TASK_DELEGATION_HYGIENE.md:5` 中的本地绝对路径协议链接已改相对链接；同模式已补入门禁 `FORBIDDEN`（`local absolute file link`，正反控制：leak-match True / self-match False） |
-
-**交付物清单**：5/5 全部 `[x]`（含最终核验项，签收状态已更新为 Signed Off；任务 4 标记 ✅）。
-
-**本地未提交改动（按您决定暂存）**
-- `M TASK_DELEGATION_HYGIENE.md`（脱敏 + 签收勾选）
-- `M tests/test_repo_hygiene.py`（+1 门禁模式）
-- `?? TASK_DEV_BACKEND.md`、`?? TASK_DEV_FRONTEND.md`（已审计：无敏感内容）
-
-**发布门禁唯一行动项**（完成后即达公开仓库完全合规）
-```bash
-git add -A
-git commit -m "chore: sign off repo hygiene audit; desensitize local path links and extend privacy gate"
-git push origin main
-```
-
-**备注**：本机无 `py` 启动器，SPEC 中 `py -3 -m unittest` 请以 `python -m unittest` 执行（已验证等效）；SPEC.md §12 背景段引用的旧提交 `3bb63a5` 已无任何副本，属历史叙述，无需再改写历史；全量测试控制台的 UnicodeEncodeError 为 cp1252 日志噪音（既有现象，非测试失败）。
+**跨域移交/观察**
+1. `GET /tasks` 500 竞态已最小修复（`core/persistence.py:104` 容错读取，修复前 repro 3 errors → 修复后 0；`repro_tasks_race.py`）。
+2. **`POST /tasks` 上下文泄漏（未改，待后端裁定）**：长驻 Agent 将上一会话消息重序列化进新任务 checkpoint，`task2_nodes=18` 且含 task1 提示词，与 SPEC.md:158「CLI 一次性模式」语义不符；复现脚本 `repro_task_context_leak.py`。
+3. providers 编辑器所写 `local_dev` 档已取代此前误存的默认模板（曾致 8080 掉线重试），保存往返幂等。
+4. 守护进程现 PID 6864（含竞态修复），mock 模型端点 PID 32464，Chrome 调试口 9222 均保留，供复核。
