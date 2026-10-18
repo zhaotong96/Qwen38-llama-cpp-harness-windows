@@ -47,6 +47,16 @@
         </div>
       </div>
 
+      <div class="tree-legend" id="tree-legend">
+        <span><i class="legend-dot" style="background:#94a3b8"></i>system</span>
+        <span><i class="legend-dot" style="background:#38bdf8"></i>user</span>
+        <span><i class="legend-dot" style="background:#22c55e"></i>assistant</span>
+        <span><i class="legend-dot" style="background:#a855f7"></i>reasoning</span>
+        <span><i class="legend-dot" style="background:#f59e0b"></i>tool_calls</span>
+        <span><i class="legend-dot" style="background:#2dd4bf"></i>tool</span>
+        <span><i class="legend-dot" style="background:#ec4899"></i>compaction</span>
+      </div>
+
       <div class="tree-container" id="dag-tree-container">
         <div class="empty-hint">暂无节点，提交任务后实时映射 checkpoint.jsonl</div>
       </div>
@@ -63,6 +73,9 @@
         <div class="stream-header">
           <span id="stream-step-label">实时解码流 (Idle)</span>
           <span id="stream-seq-label">seq: 0</span>
+          <span id="stream-char-label">chars: 0 ≈ tokens: 0</span>
+          <span class="stream-spacer"></span>
+          <button type="button" id="btn-clear-stream" class="btn btn-small">清空流</button>
         </div>
         <pre class="stream-output" id="live-stream-output"></pre>
       </div>
@@ -72,6 +85,7 @@
       <form class="composer" id="task-composer">
         <textarea id="task-input" rows="3" placeholder="输入指令：可直接启动执行，或加入双端同步排队队列 (.agent/queue/)..."></textarea>
         <div class="composer-footer">
+          <span class="composer-notice" id="composer-notice"></span>
           <div class="composer-options">
             <label>优先级:
               <select id="queue-priority">
