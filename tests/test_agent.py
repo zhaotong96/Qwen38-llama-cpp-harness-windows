@@ -53,6 +53,105 @@ class TerminalStatusTests(unittest.TestCase):
         self.assertEqual(agent_mod._terminal_status("plain answer"), "finished")
 
 
+class ContextLeakTests(IsolatedCase):
+    """Sequential tasks on one agent must never leak history into each other."""
+
+    def test_second_task_checkpoint_starts_clean(self):
+        agent, llm = build_agent(
+            [
+                {"content": "first answer"},
+                {"content": "TASK_DONE: second done"},
+            ]
+        )
+        agent.run_task("first task")
+        first_id = agent.current_task_id
+        agent.run_task("second task")
+        second_id = agent.current_task_id
+        self.assertNotEqual(first_id, second_id)
+
+        second_messages, _ = persistence.load_checkpoint(second_id)
+        contents = [str(m.get("content", "")) for m in second_messages]
+        self.assertFalse(any("first task" in c for c in contents))
+        self.assertFalse(any("first answer" in c for c in contents))
+        self.assertEqual(len(second_messages), 3)
+        self.assertEqual(second_messages[0]["role"], "system")
+        self.assertEqual(second_messages[1], {"role": "user", "content": "second task"})
+
+        second_request_messages = llm.requests[1]["messages"]
+        self.assertEqual(len(second_request_messages), 2)
+
+
+class JsonArgumentErrorTests(IsolatedCase):
+    """Malformed tool arguments produce a precise syntax receipt, never a blind default call."""
+
+    def test_malformed_json_is_reported_not_executed(self):
+        executed: list[str] = []
+        replies = [
+            {
+                "tool_calls": [
+                    {"id": "call_bad", "name": "mouse", "arguments": '{"x": 10,,}'}
+                ]
+            },
+            {"content": "TASK_DONE: corrected"},
+        ]
+        agent, llm = build_agent(replies)
+        agent.dispatchers["mouse"] = lambda args: executed.append("mouse") or "clicked"
+
+        final = agent.run_task("click something")
+
+        self.assertIn("TASK_DONE", final)
+        self.assertEqual(executed, [])
+        followup_messages = llm.requests[1]["messages"]
+        tool_messages = [m for m in followup_messages if m.get("role") == "tool"]
+        self.assertTrue(tool_messages)
+        receipt = tool_messages[-1]
+        self.assertEqual(receipt["tool_call_id"], "call_bad")
+        self.assertTrue(receipt["content"].startswith("error:"))
+        self.assertIn("JSONDecodeError", receipt["content"])
+        self.assertIn("char 9", receipt["content"])
+
+
+class ChatHyperparameterTests(IsolatedCase):
+    """Prefix stability: tools stay attached; sampling is low-temperature with MTP extras."""
+
+    def test_tools_stay_attached_when_forcing_text(self):
+        agent, llm = build_agent([{"content": "text only"}])
+        agent.chat(tool_choice="none")
+        kwargs = llm.requests[-1]
+        self.assertIn("tools", kwargs)
+        self.assertTrue(kwargs["tools"])
+        self.assertEqual(kwargs["tool_choice"], "none")
+        self.assertEqual(kwargs["temperature"], 0.2)
+        self.assertEqual(kwargs["top_p"], 0.95)
+
+    def test_chat_extra_carries_mtp_friendly_defaults(self):
+        agent, llm = build_agent([{"content": "text only"}])
+        agent.chat()
+        extra = llm.requests[-1]["extra_body"]
+        self.assertEqual(extra["top_k"], 20)
+        self.assertEqual(extra["min_p"], 0.05)
+        self.assertEqual(extra["repeat_penalty"], 1.05)
+        self.assertTrue(extra["cache_prompt"])
+        self.assertTrue(extra["chat_template_kwargs"]["enable_thinking"])
+        self.assertTrue(extra["chat_template_kwargs"]["preserve_thinking"])
+
+
+class FactLedgerSummaryTests(IsolatedCase):
+    def test_summarize_request_is_a_thinking_free_five_section_ledger(self):
+        agent, llm = build_agent([{"content": "1. 核心目标与进度\n已完成"}])
+        summary = agent._summarize([{"role": "user", "content": "did things"}])
+
+        self.assertIn("核心目标与进度", summary)
+        request = llm.requests[-1]
+        self.assertEqual(request["max_tokens"], 2048)
+        self.assertEqual(request["temperature"], 0.2)
+        self.assertFalse(request["extra_body"]["chat_template_kwargs"]["enable_thinking"])
+        prompt = request["messages"][0]["content"]
+        for section in ("1. 核心目标与进度", "2. 已验证事实与环境基线", "3. 已修改文件清单",
+                        "4. 被否决方案与操作员红线（永久保留）", "5. 待完成子目标与下一步行动"):
+            self.assertIn(section, prompt)
+
+
 class RunTaskTests(IsolatedCase):
     def test_status_and_checkpoint_written(self):
         agent, llm = build_agent([{"content": "TASK_DONE: all good"}])

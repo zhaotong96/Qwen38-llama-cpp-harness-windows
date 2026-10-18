@@ -28,10 +28,19 @@ from core.models import (
 )
 
 # Context management policy ratios (strategy choices, not model facts).
-COMPACT_TRIGGER_RATIO = 0.9   # compact when payload reaches 90% of the window
-COMPACT_TARGET_RATIO = 0.5    # fold history down to ~50% of the window
+COMPACT_TRIGGER_RATIO = 0.5   # compact when payload reaches 50% of the window
+COMPACT_TARGET_RATIO = 0.25   # fold history down to ~25% of the window
 
 VALID_ROLES = ("main", "subagent", "compactor")
+
+# Process-level probe cache: key -> resolved n_ctx. Prevents front-end refresh
+# storms from re-probing the model server; cleared on providers hot reload.
+_PROBED_WINDOW_CACHE: dict[str, int] = {}
+
+
+def reset_probe_cache() -> None:
+    """Drop every cached context window so the next load probes live."""
+    _PROBED_WINDOW_CACHE.clear()
 
 _ROLE_ENV_PREFIX = {
     "main": "MAIN",
@@ -114,14 +123,31 @@ def load_providers_file(providers_path: Path | None = None) -> dict[str, Any] | 
 
 
 def save_providers_file(data: dict[str, Any], providers_path: Path | None = None) -> Path:
-    """Atomically write .agent/providers.json after validating structure."""
+    """Atomically write .agent/providers.json after validating structure.
+
+    Saving is the hot-reload trigger: the probe cache is dropped so the next
+    configuration load re-probes every endpoint against its new provider.
+    """
     if not isinstance(data, dict):
         raise ValueError("providers configuration must be a JSON object")
     path = _providers_file_path(providers_path)
-    return persistence.atomic_write_text(
+    written = persistence.atomic_write_text(
         path,
         json.dumps(data, ensure_ascii=False, indent=2) + "\n",
     )
+    reset_probe_cache()
+    return written
+
+
+def _slot_for_role(role: str) -> int:
+    """Dual-slot affinity: main owns slot 0; subagent and compactor share slot 1."""
+    return 0 if role == "main" else 1
+
+
+def _with_slot_affinity(chat_extra: dict[str, Any], role: str) -> dict[str, Any]:
+    merged = dict(chat_extra)
+    merged.setdefault("id_slot", _slot_for_role(role))
+    return merged
 
 
 def _resolve_role_endpoint(
@@ -148,6 +174,7 @@ def _resolve_role_endpoint(
             api_key_env = str(profile.get("api_key_env") or "")
             api_key = (os.environ.get(api_key_env) if api_key_env else None) or default_api_key
             chat_extra = profile.get("chat_extra")
+            resolved_extra = dict(chat_extra) if isinstance(chat_extra, dict) else dict(CHAT_EXTRA)
             return {
                 "role": role,
                 "profile_name": profile_name,
@@ -158,7 +185,7 @@ def _resolve_role_endpoint(
                 "fallback_n_ctx": int(profile.get("fallback_n_ctx") or FALLBACK_N_CTX),
                 "price_per_1m_input": float(profile.get("price_per_1m_input") or 0.0),
                 "price_per_1m_output": float(profile.get("price_per_1m_output") or 0.0),
-                "chat_extra": dict(chat_extra) if isinstance(chat_extra, dict) else dict(CHAT_EXTRA),
+                "chat_extra": _with_slot_affinity(resolved_extra, role),
             }
 
     # Tier 2: Role-specific environment variables
@@ -177,7 +204,7 @@ def _resolve_role_endpoint(
             "fallback_n_ctx": FALLBACK_N_CTX,
             "price_per_1m_input": 0.0,
             "price_per_1m_output": 0.0,
-            "chat_extra": dict(CHAT_EXTRA),
+            "chat_extra": _with_slot_affinity(dict(CHAT_EXTRA), role),
         }
 
     # Tier 3: Global GEMMA_* baseline
@@ -191,18 +218,29 @@ def _resolve_role_endpoint(
         "fallback_n_ctx": FALLBACK_N_CTX,
         "price_per_1m_input": 0.0,
         "price_per_1m_output": 0.0,
-        "chat_extra": dict(CHAT_EXTRA),
+        "chat_extra": _with_slot_affinity(dict(CHAT_EXTRA), role),
     }
 
 
-def _probe_window(base_url: str, fallback: int = FALLBACK_N_CTX) -> int:
-    """Invoke probe_context_window while staying compatible with 1-arg test mocks."""
+def _probe_window(base_url: str, model: str = "", fallback: int = FALLBACK_N_CTX) -> int:
+    """Resolve the context window through the process-level probe cache.
+
+    Cache hit -> no network traffic. Cache miss -> call probe_context_window
+    while staying compatible with 1-arg test mocks.
+    """
+    cache_key = f"{base_url.rstrip('/')}|{model or 'default'}"
+    cached = _PROBED_WINDOW_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
     if fallback == FALLBACK_N_CTX:
-        return probe_context_window(base_url)
-    try:
-        return probe_context_window(base_url, fallback=fallback)
-    except TypeError:
-        return probe_context_window(base_url)
+        n_ctx = probe_context_window(base_url)
+    else:
+        try:
+            n_ctx = probe_context_window(base_url, fallback=fallback)
+        except TypeError:
+            n_ctx = probe_context_window(base_url)
+    _PROBED_WINDOW_CACHE[cache_key] = n_ctx
+    return n_ctx
 
 
 def load_config(role: str = "main", providers_path: Path | None = None) -> AgentConfig:
@@ -215,7 +253,9 @@ def load_config(role: str = "main", providers_path: Path | None = None) -> Agent
     """
     providers_data = load_providers_file(providers_path)
     resolved = _resolve_role_endpoint(role=role, providers_data=providers_data)
-    n_ctx = _probe_window(resolved["base_url"], fallback=resolved["fallback_n_ctx"])
+    n_ctx = _probe_window(
+        resolved["base_url"], model=resolved["model"], fallback=resolved["fallback_n_ctx"]
+    )
     fields = derive_context_fields(n_ctx)
     return AgentConfig(
         base_url=resolved["base_url"],
@@ -231,18 +271,18 @@ def load_config(role: str = "main", providers_path: Path | None = None) -> Agent
 
 
 def load_all_role_configs(providers_path: Path | None = None) -> dict[str, AgentConfig]:
-    """Load AgentConfig instances for all three roles (main, subagent, compactor)."""
+    """Load AgentConfig instances for all three roles (main, subagent, compactor).
+
+    Repeated calls (e.g. front-end refreshes hitting GET /config/providers)
+    reuse the process-level probe cache and send no extra network traffic.
+    """
     providers_data = load_providers_file(providers_path)
     configs: dict[str, AgentConfig] = {}
-    probed_cache: dict[tuple[str, int], int] = {}
     for role in VALID_ROLES:
         resolved = _resolve_role_endpoint(role=role, providers_data=providers_data)
-        cache_key = (resolved["base_url"], resolved["fallback_n_ctx"])
-        if cache_key not in probed_cache:
-            probed_cache[cache_key] = _probe_window(
-                resolved["base_url"], fallback=resolved["fallback_n_ctx"]
-            )
-        n_ctx = probed_cache[cache_key]
+        n_ctx = _probe_window(
+            resolved["base_url"], model=resolved["model"], fallback=resolved["fallback_n_ctx"]
+        )
         fields = derive_context_fields(n_ctx)
         configs[role] = AgentConfig(
             base_url=resolved["base_url"],

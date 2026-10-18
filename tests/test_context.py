@@ -41,6 +41,65 @@ class ScreenshotRetentionTests(unittest.TestCase):
         self.assertIsInstance(ctx.messages[3]["content"], list)  # newest kept as image
 
 
+class TokenEstimateDensityTests(unittest.TestCase):
+    def test_chinese_is_weighted_higher_than_ascii(self):
+        ctx = ContextManager("sys")
+        base = ctx.token_estimate()
+        ctx.append({"role": "user", "content": "中" * 100})
+        self.assertEqual(ctx.token_estimate() - base, 75)
+
+    def test_reasoning_and_tool_calls_are_counted(self):
+        ctx = ContextManager("sys")
+        base = ctx.token_estimate()
+        ctx.append(
+            {
+                "role": "assistant",
+                "content": "",
+                "reasoning_content": "x" * 400,
+                "tool_calls": [
+                    {
+                        "id": "c1",
+                        "type": "function",
+                        "function": {"name": "mouse", "arguments": "{\"x\": 1}"},
+                    }
+                ],
+            }
+        )
+        self.assertGreater(ctx.token_estimate() - base, 100)
+
+    def test_image_observation_costs_1120(self):
+        ctx = ContextManager("sys")
+        base = ctx.token_estimate()
+        ctx.append(image_message(".agent/screen_000.jpg"))
+        text_part = "Image observation attached. Continue. (file at .agent/screen_000.jpg)"
+        ascii_cost = int(len(text_part) * 0.25)
+        self.assertEqual(ctx.token_estimate() - base, 1120 + ascii_cost)
+
+
+class HysteresisWindowTests(unittest.TestCase):
+    def test_batch_eviction_only_after_high_watermark(self):
+        ctx = ContextManager("sys", max_screenshots=6, retain_screenshots=2)
+        for i in range(6):
+            ctx.append(image_message(f".agent/screen_{i:03d}.jpg"))
+        kept = [m for m in ctx.messages if isinstance(m["content"], list)]
+        self.assertEqual(len(kept), 6)
+
+        ctx.append(image_message(".agent/screen_006.jpg"))
+        kept = [m for m in ctx.messages if isinstance(m["content"], list)]
+        self.assertEqual(len(kept), 2)
+        placeholders = [
+            m
+            for m in ctx.messages
+            if isinstance(m["content"], str) and "screenshot removed" in m["content"]
+        ]
+        self.assertEqual(len(placeholders), 5)
+        self.assertIn("screen_006.jpg", str(ctx.messages[-1]))
+
+    def test_default_retain_is_half_of_high_watermark(self):
+        ctx = ContextManager("sys", max_screenshots=4)
+        self.assertEqual(ctx.retain_screenshots, 2)
+
+
 class CompactionTests(unittest.TestCase):
     def test_compact_folds_old_messages(self):
         ctx = ContextManager("sys")

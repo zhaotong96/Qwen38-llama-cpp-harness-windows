@@ -19,11 +19,76 @@ class DeriveContextFieldsTests(unittest.TestCase):
         fields = config_mod.derive_context_fields(8000)
         self.assertEqual(fields["n_ctx"], 8000)
         self.assertEqual(fields["max_gen_tokens"], 4000)
-        self.assertEqual(fields["compact_trigger"], 7200)
-        self.assertEqual(fields["compact_target"], 4000)
+        self.assertEqual(fields["compact_trigger"], 4000)
+        self.assertEqual(fields["compact_target"], 2000)
+
+
+class ProbeCacheTests(unittest.TestCase):
+    """The probe cache stops front-end refresh storms from re-probing the server."""
+
+    def setUp(self):
+        config_mod.reset_probe_cache()
+        self.addCleanup(config_mod.reset_probe_cache)
+
+    def test_repeated_lookups_hit_the_cache(self):
+        with mock.patch.object(config_mod, "probe_context_window", return_value=64000) as probe:
+            first = config_mod._probe_window("http://cache.test/v1", model="m")
+            second = config_mod._probe_window("http://cache.test/v1", model="m")
+        self.assertEqual(first, 64000)
+        self.assertEqual(second, 64000)
+        self.assertEqual(probe.call_count, 1)
+
+    def test_model_changes_use_distinct_cache_keys(self):
+        with mock.patch.object(config_mod, "probe_context_window", return_value=64000) as probe:
+            config_mod._probe_window("http://cache.test/v1", model="a")
+            config_mod._probe_window("http://cache.test/v1", model="b")
+        self.assertEqual(probe.call_count, 2)
+
+    def test_hot_reload_resets_the_cache(self):
+        with mock.patch.object(config_mod, "probe_context_window", return_value=64000) as probe:
+            config_mod._probe_window("http://cache.test/v1", model="m")
+            config_mod.reset_probe_cache()
+            config_mod._probe_window("http://cache.test/v1", model="m")
+        self.assertEqual(probe.call_count, 2)
+
+    def test_save_providers_file_clears_the_cache(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config_mod._PROBED_WINDOW_CACHE["stale|key"] = 1
+            config_mod.save_providers_file(config_mod.DEFAULT_PROVIDERS_TEMPLATE, providers_path=Path(tmp) / "p.json")
+        self.assertEqual(config_mod._PROBED_WINDOW_CACHE, {})
+
+
+class SlotAffinityTests(unittest.TestCase):
+    """Dual-slot affinity: main -> id_slot 0; subagent/compactor -> id_slot 1."""
+
+    def test_role_chat_extra_carries_id_slot(self):
+        main = config_mod._resolve_role_endpoint("main", providers_data=None)
+        sub = config_mod._resolve_role_endpoint("subagent", providers_data=None)
+        comp = config_mod._resolve_role_endpoint("compactor", providers_data=None)
+        self.assertEqual(main["chat_extra"]["id_slot"], 0)
+        self.assertEqual(sub["chat_extra"]["id_slot"], 1)
+        self.assertEqual(comp["chat_extra"]["id_slot"], 1)
+
+    def test_explicit_id_slot_is_respected(self):
+        providers = {
+            "active_profiles": {"main": "custom"},
+            "profiles": {
+                "custom": {
+                    "base_url": "http://slot.test/v1",
+                    "model": "m",
+                    "chat_extra": {"id_slot": 5},
+                }
+            },
+        }
+        resolved = config_mod._resolve_role_endpoint("main", providers_data=providers)
+        self.assertEqual(resolved["chat_extra"]["id_slot"], 5)
 
 
 class LoadConfigTests(unittest.TestCase):
+    def setUp(self):
+        config_mod.reset_probe_cache()
+        self.addCleanup(config_mod.reset_probe_cache)
+
     def test_load_config_uses_probed_window(self):
         with mock.patch.object(config_mod, "probe_context_window", return_value=12345):
             cfg = config_mod.load_config()
@@ -89,6 +154,10 @@ class EndpointConfigurationTests(unittest.TestCase):
 
 class MultiApiTieredRoutingTests(unittest.TestCase):
     """Tests for Multi-API role-tiered subscription routing (GATE-FUNC-05)."""
+
+    def setUp(self):
+        config_mod.reset_probe_cache()
+        self.addCleanup(config_mod.reset_probe_cache)
 
     def test_providers_json_routes_main_subagent_and_compactor_independently(self):
         with tempfile.TemporaryDirectory() as tmp:

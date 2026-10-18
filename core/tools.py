@@ -14,6 +14,7 @@ import re
 import signal
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 
@@ -37,6 +38,67 @@ try:
 except ImportError:
     mss = None
     Image = None
+
+if sys.platform == "win32":
+    import ctypes
+    from ctypes import wintypes
+
+    _kernel32 = ctypes.windll.kernel32
+
+    JOB_OBJECT_LIMIT_ACTIVE_PROCESS = 0x00000008
+    JOB_OBJECT_LIMIT_JOB_MEMORY = 0x00000200
+    JOB_OBJECT_LIMIT_DIE_ON_UNHANDLED_EXCEPTION = 0x00000400
+    JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x00002000
+    JOB_OBJECT_EXTENDED_LIMIT_INFORMATION_CLASS = 9
+
+    class _JOBOBJECT_BASIC_LIMIT_INFORMATION(ctypes.Structure):
+        _fields_ = [
+            ("PerProcessUserTimeLimit", ctypes.c_int64),
+            ("PerJobUserTimeLimit", ctypes.c_int64),
+            ("LimitFlags", wintypes.DWORD),
+            ("MinimumWorkingSetSize", ctypes.c_size_t),
+            ("MaximumWorkingSetSize", ctypes.c_size_t),
+            ("ActiveProcessLimit", wintypes.DWORD),
+            ("Affinity", ctypes.c_size_t),
+            ("PriorityClass", wintypes.DWORD),
+            ("SchedulingClass", wintypes.DWORD),
+        ]
+
+    class _IO_COUNTERS(ctypes.Structure):
+        _fields_ = [
+            ("ReadOperationCount", ctypes.c_uint64),
+            ("WriteOperationCount", ctypes.c_uint64),
+            ("OtherOperationCount", ctypes.c_uint64),
+            ("ReadTransferCount", ctypes.c_uint64),
+            ("WriteTransferCount", ctypes.c_uint64),
+            ("OtherTransferCount", ctypes.c_uint64),
+        ]
+
+    class _JOBOBJECT_EXTENDED_LIMIT_INFORMATION(ctypes.Structure):
+        _fields_ = [
+            ("BasicLimitInformation", _JOBOBJECT_BASIC_LIMIT_INFORMATION),
+            ("IoInfo", _IO_COUNTERS),
+            ("ProcessMemoryLimit", ctypes.c_size_t),
+            ("JobMemoryLimit", ctypes.c_size_t),
+            ("PeakProcessMemoryUsed", ctypes.c_size_t),
+            ("PeakJobMemoryUsed", ctypes.c_size_t),
+        ]
+
+    _kernel32.CreateJobObjectW.argtypes = [wintypes.LPVOID, wintypes.LPCWSTR]
+    _kernel32.CreateJobObjectW.restype = wintypes.HANDLE
+    _kernel32.SetInformationJobObject.argtypes = [
+        wintypes.HANDLE,
+        ctypes.c_int,
+        wintypes.LPVOID,
+        wintypes.DWORD,
+    ]
+    _kernel32.SetInformationJobObject.restype = wintypes.BOOL
+    _kernel32.AssignProcessToJobObject.argtypes = [wintypes.HANDLE, wintypes.HANDLE]
+    _kernel32.AssignProcessToJobObject.restype = wintypes.BOOL
+    _kernel32.TerminateJobObject.argtypes = [wintypes.HANDLE, wintypes.UINT]
+    _kernel32.TerminateJobObject.restype = wintypes.BOOL
+    _kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+    _kernel32.CloseHandle.restype = wintypes.BOOL
 
 _screenshot_counter = 0
 _active_context = threading.local()
@@ -62,6 +124,143 @@ def _is_active_execution_aborted() -> dict | None:
         if info:
             return info
     return None
+
+
+def execution_aborted() -> dict | None:
+    """Public abort probe for skills that launch their own subprocesses."""
+    return _is_active_execution_aborted()
+
+
+def _create_kill_on_close_job(
+    max_memory_bytes: int = 4 * 1024 ** 3,
+    max_procs: int = 64,
+) -> int | None:
+    """Create a Win32 Job Object that reaps the whole process tree on handle close."""
+    if sys.platform != "win32":
+        return None
+    h_job = _kernel32.CreateJobObjectW(None, None)
+    if not h_job:
+        return None
+    info = _JOBOBJECT_EXTENDED_LIMIT_INFORMATION()
+    info.BasicLimitInformation.LimitFlags = (
+        JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+        | JOB_OBJECT_LIMIT_DIE_ON_UNHANDLED_EXCEPTION
+        | JOB_OBJECT_LIMIT_JOB_MEMORY
+        | JOB_OBJECT_LIMIT_ACTIVE_PROCESS
+    )
+    info.JobMemoryLimit = max_memory_bytes
+    info.BasicLimitInformation.ActiveProcessLimit = max_procs
+    ok = _kernel32.SetInformationJobObject(
+        h_job,
+        JOB_OBJECT_EXTENDED_LIMIT_INFORMATION_CLASS,
+        ctypes.byref(info),
+        ctypes.sizeof(info),
+    )
+    if not ok:
+        _kernel32.CloseHandle(h_job)
+        return None
+    return int(h_job)
+
+
+def _assign_process_to_job(h_job: int | None, proc: subprocess.Popen) -> bool:
+    if not h_job or sys.platform != "win32":
+        return False
+    try:
+        process_handle = int(proc._handle)
+    except (AttributeError, TypeError, ValueError):
+        return False
+    return bool(_kernel32.AssignProcessToJobObject(h_job, process_handle))
+
+
+def _terminate_job(h_job: int | None) -> None:
+    if not h_job or sys.platform != "win32":
+        return
+    try:
+        _kernel32.TerminateJobObject(h_job, 1)
+    except Exception:
+        pass
+
+
+def _close_handle(h_job: int | None) -> None:
+    if not h_job or sys.platform != "win32":
+        return
+    try:
+        _kernel32.CloseHandle(h_job)
+    except Exception:
+        pass
+
+
+def _drain_stream(stream, sink: list[str]) -> None:
+    """Continuously drain one child pipe so the OS buffer can never block the child."""
+    try:
+        for chunk in iter(stream.readline, ""):
+            sink.append(chunk)
+    except Exception:
+        pass
+    finally:
+        try:
+            stream.close()
+        except Exception:
+            pass
+
+
+def _run_process(argv: list[str], timeout: float) -> tuple[str, str, str, int | None]:
+    """Run argv inside the Job Object sandbox with live stdout/stderr drains.
+
+    Returns (status, stdout, stderr, returncode) where status is one of
+    "ok", "timeout", "interrupted", or "spawn_error".
+    """
+    popen_kwargs: dict = {
+        "stdout": subprocess.PIPE,
+        "stderr": subprocess.PIPE,
+        "text": True,
+        "encoding": "utf-8",
+        "errors": "replace",
+        "cwd": str(ROOT),
+    }
+    if sys.platform != "win32":
+        popen_kwargs["start_new_session"] = True
+
+    try:
+        proc = subprocess.Popen(argv, **popen_kwargs)
+    except OSError as e:
+        return "spawn_error", "", str(e), None
+
+    h_job = _create_kill_on_close_job()
+    if h_job:
+        _assign_process_to_job(h_job, proc)
+
+    stdout_chunks: list[str] = []
+    stderr_chunks: list[str] = []
+    drain_out = threading.Thread(target=_drain_stream, args=(proc.stdout, stdout_chunks), daemon=True)
+    drain_err = threading.Thread(target=_drain_stream, args=(proc.stderr, stderr_chunks), daemon=True)
+    drain_out.start()
+    drain_err.start()
+
+    status = "ok"
+    deadline = time.monotonic() + max(0.0, float(timeout))
+    try:
+        while proc.poll() is None:
+            if _is_active_execution_aborted():
+                status = "interrupted"
+                break
+            if time.monotonic() >= deadline:
+                status = "timeout"
+                break
+            time.sleep(0.05)
+    finally:
+        if status != "ok":
+            _terminate_job(h_job)
+        _close_handle(h_job)
+        if status != "ok":
+            _terminate_process_tree(proc)
+        drain_out.join(timeout=5)
+        drain_err.join(timeout=5)
+        try:
+            proc.wait(timeout=5)
+        except Exception:
+            _terminate_process_tree(proc)
+    return status, "".join(stdout_chunks), "".join(stderr_chunks), proc.returncode
 
 
 def _terminate_process_tree(proc: subprocess.Popen) -> None:
@@ -108,9 +307,24 @@ def safe_path(path: str) -> Path:
     return (ROOT / p).resolve() if not p.is_absolute() else p.resolve()
 
 
+def _is_within(path: Path, root: Path) -> bool:
+    try:
+        path.relative_to(root)
+        return True
+    except ValueError:
+        return False
+
+
 def writable_path(path: str) -> Path:
-    """Resolve path cleanly according to OS permission semantics."""
-    return safe_path(path)
+    """Resolve a write target, constraining writes to the workspace and the system temp dir."""
+    p = safe_path(path)
+    allowed_roots = (ROOT.resolve(), Path(tempfile.gettempdir()).resolve())
+    if not any(_is_within(p, root) for root in allowed_roots):
+        raise PermissionError(
+            f"write denied outside workspace and temp dir: {p} "
+            f"(allowed roots: {allowed_roots[0]}, {allowed_roots[1]})"
+        )
+    return p
 
 
 def log_safety(message: str) -> None:
@@ -230,47 +444,30 @@ def tool_shell(command: str, task_id: str | None = None) -> str:
     if _is_active_execution_aborted():
         return "[EXECUTION_REJECTED] Shell command refused via abort.flag marker before execution."
 
-    popen_kwargs: dict = {
-        "stdout": subprocess.PIPE,
-        "stderr": subprocess.PIPE,
-        "text": True,
-        "encoding": "utf-8",
-        "errors": "replace",
-        "cwd": str(ROOT),
-    }
-    if sys.platform != "win32":
-        popen_kwargs["start_new_session"] = True
-
     try:
-        proc = subprocess.Popen(
+        status, stdout, stderr, returncode = _run_process(
             ["pwsh", "-NoProfile", "-Command", command],
-            **popen_kwargs,
+            SHELL_TIMEOUT,
         )
-        deadline = time.time() + SHELL_TIMEOUT
-        while proc.poll() is None:
-            if _is_active_execution_aborted():
-                _terminate_process_tree(proc)
-                return (
-                    "[EXECUTION_INTERRUPTED_AND_IGNORED] Tool 'shell' was interrupted by operator; "
-                    "its output and side-effects have been ignored."
-                )
-            if time.time() >= deadline:
-                _terminate_process_tree(proc)
-                return f"error: timed out after {SHELL_TIMEOUT}s"
-            time.sleep(0.05)
-
-        stdout, stderr = proc.communicate(timeout=5)
-        if _is_active_execution_aborted():
-            return (
-                "[EXECUTION_INTERRUPTED_AND_IGNORED] Tool 'shell' was interrupted by operator; "
-                "its output and side-effects have been ignored."
-            )
-        body = trunc(((stdout or "") + (stderr or "")).strip() or "(no output)")
-        return f"exit={proc.returncode}\n{body}"
-    except subprocess.TimeoutExpired:
-        return f"error: timed out after {SHELL_TIMEOUT}s"
     except Exception as e:
         return f"error: {e}"
+
+    if status == "interrupted":
+        return (
+            "[EXECUTION_INTERRUPTED_AND_IGNORED] Tool 'shell' was interrupted by operator; "
+            "its output and side-effects have been ignored."
+        )
+    if status == "timeout":
+        return f"error: timed out after {SHELL_TIMEOUT}s"
+    if status == "spawn_error":
+        return f"error: {stderr}"
+    if _is_active_execution_aborted():
+        return (
+            "[EXECUTION_INTERRUPTED_AND_IGNORED] Tool 'shell' was interrupted by operator; "
+            "its output and side-effects have been ignored."
+        )
+    body = trunc(((stdout or "") + (stderr or "")).strip() or "(no output)")
+    return f"exit={returncode}\n{body}"
 
 
 def tool_read(path: str) -> str:
@@ -312,25 +509,22 @@ def tool_search(pattern: str, path: str = ".", glob: str = "") -> str:
         cmd += ["--glob", glob]
     cmd += [pattern, path]
     try:
-        r = subprocess.run(
-            cmd,
-            capture_output=True,
-            text=True,
-            timeout=30,
-            encoding="utf-8",
-            errors="replace",
-            cwd=str(ROOT),
-        )
-        if r.returncode == 0 and r.stdout.strip():
-            return trunc(r.stdout.strip())
-        if r.returncode == 1:
-            return "(no matches)"
-    except FileNotFoundError:
-        pass
-    except subprocess.TimeoutExpired:
-        return "error: search timed out"
+        status, stdout, stderr, returncode = _run_process(cmd, 30)
     except Exception as e:
         return f"error: {e}"
+
+    if status == "interrupted":
+        return (
+            "[EXECUTION_INTERRUPTED_AND_IGNORED] Tool 'search' was interrupted by operator; "
+            "its output and side-effects have been ignored."
+        )
+    if status == "timeout":
+        return "error: search timed out"
+    if status == "ok":
+        if returncode == 0 and stdout.strip():
+            return trunc(stdout.strip())
+        if returncode == 1:
+            return "(no matches)"
 
     g = glob or "*"
     ps = (

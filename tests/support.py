@@ -12,6 +12,7 @@ installed before the harness core gets imported.
 from __future__ import annotations
 
 import contextlib
+import copy
 import tempfile
 import time
 import types
@@ -58,7 +59,10 @@ class ScriptedLLM:
         self.completions = self
 
     def create(self, **kwargs: Any):
-        self.requests.append(kwargs)
+        snapshot = dict(kwargs)
+        if "messages" in snapshot:
+            snapshot["messages"] = copy.deepcopy(snapshot["messages"])
+        self.requests.append(snapshot)
         reply = self.replies.pop(0) if self.replies else {"content": "TASK_DONE: stub"}
         if reply.get("raise"):
             raise RuntimeError(reply["raise"])

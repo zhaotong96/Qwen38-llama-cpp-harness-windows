@@ -38,7 +38,13 @@ SHELL_TIMEOUT = 120
 CHROME_CDP_PORT = 9222
 
 # LLM Chat Settings
-CHAT_EXTRA = {"chat_template_kwargs": {"enable_thinking": True}}
+CHAT_EXTRA = {
+    "top_k": 20,
+    "min_p": 0.05,
+    "repeat_penalty": 1.05,
+    "cache_prompt": True,
+    "chat_template_kwargs": {"enable_thinking": True, "preserve_thinking": True},
+}
 # Context window probing: model facts come from the server, not constants.
 FALLBACK_N_CTX = 32768
 GEN_OVERHEAD_MARGIN = 2048

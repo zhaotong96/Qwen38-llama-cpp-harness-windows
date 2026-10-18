@@ -2,10 +2,30 @@
 from __future__ import annotations
 
 import copy
+import json
 import re
 from typing import Any, Callable
 
 from core import persistence
+
+
+def _is_cjk(char: str) -> bool:
+    code = ord(char)
+    return (
+        0x3400 <= code <= 0x4DBF      # CJK Unified Ideographs Extension A
+        or 0x4E00 <= code <= 0x9FFF   # CJK Unified Ideographs
+        or 0xF900 <= code <= 0xFAFF   # CJK Compatibility Ideographs
+        or 0x3000 <= code <= 0x303F   # CJK punctuation
+        or 0xFF00 <= code <= 0xFFEF   # Full-width forms
+    )
+
+
+def estimate_text_tokens(text: str) -> int:
+    """Weighted character estimate: CJK 0.75 token/char, other text 0.25 token/char."""
+    if not text:
+        return 0
+    cjk = sum(1 for char in text if _is_cjk(char))
+    return int(cjk * 0.75 + (len(text) - cjk) * 0.25)
 
 
 class ContextManager:
@@ -15,10 +35,15 @@ class ContextManager:
         self,
         system_prompt: str,
         max_screenshots: int = 3,
+        retain_screenshots: int | None = None,
         task_id: str | None = None,
         branch: str | None = None,
     ) -> None:
         self.max_screenshots = max(0, int(max_screenshots))
+        if retain_screenshots is None:
+            self.retain_screenshots = max(1, self.max_screenshots // 2) if self.max_screenshots else 0
+        else:
+            self.retain_screenshots = max(0, min(int(retain_screenshots), self.max_screenshots))
         self._system_message: dict[str, Any] = {
             "role": "system",
             "content": system_prompt,
@@ -51,6 +76,7 @@ class ContextManager:
             self.task_id,
             branch=target_branch,
             max_screenshots=self.max_screenshots,
+            retain_screenshots=self.retain_screenshots,
             heal_dangling_tool_calls=heal_dangling,
         )
         if projected:
@@ -141,45 +167,53 @@ class ContextManager:
             f".agent/screen_{self._screenshot_sequence:03d}.jpg"
         )
 
-        while len(self._screenshot_indices) > self.max_screenshots:
-            old_index = self._screenshot_indices.pop(0)
-            old_message = self.messages[old_index]
-            path = self._path_in_message(old_message) or self._screenshot_paths.get(
-                old_index,
-                ".agent/screen.jpg",
-            )
-            self.messages[old_index] = {
-                "role": old_message.get("role", "user"),
-                "content": f"[screenshot removed, file at {path}]",
-            }
-            self._screenshot_paths.pop(old_index, None)
+        if len(self._screenshot_indices) > self.max_screenshots:
+            while len(self._screenshot_indices) > self.retain_screenshots:
+                old_index = self._screenshot_indices.pop(0)
+                old_message = self.messages[old_index]
+                path = self._path_in_message(old_message) or self._screenshot_paths.get(
+                    old_index,
+                    ".agent/screen.jpg",
+                )
+                self.messages[old_index] = {
+                    "role": old_message.get("role", "user"),
+                    "content": f"[screenshot removed, file at {path}]",
+                }
+                self._screenshot_paths.pop(old_index, None)
         return node
 
     @staticmethod
     def _estimate_content(content: Any) -> int:
         if isinstance(content, str):
-            return len(content) // 4
+            return estimate_text_tokens(content)
         if isinstance(content, list):
             estimate = 0
             for part in content:
                 if isinstance(part, dict) and part.get("type") == "image_url":
-                    estimate += 800
+                    estimate += 1120
                 elif isinstance(part, dict) and part.get("type") == "text":
-                    estimate += len(str(part.get("text", ""))) // 4
+                    estimate += estimate_text_tokens(str(part.get("text", "")))
                 elif part is not None:
-                    estimate += len(str(part)) // 4
+                    estimate += estimate_text_tokens(str(part))
             return estimate
         if content is None:
             return 0
-        return len(str(content)) // 4
+        return estimate_text_tokens(str(content))
 
     def token_estimate(self) -> int:
-        """Return a rough token count using text length and fixed image cost."""
-        return sum(
-            self._estimate_content(message.get("content"))
-            for message in self.messages
-            if isinstance(message, dict)
-        )
+        """Weighted token estimate covering text, Chinese density, images, reasoning and tool payloads."""
+        total = 0
+        for message in self.messages:
+            if not isinstance(message, dict):
+                continue
+            total += self._estimate_content(message.get("content"))
+            reasoning = message.get("reasoning_content")
+            if reasoning:
+                total += estimate_text_tokens(str(reasoning))
+            tool_calls = message.get("tool_calls")
+            if tool_calls:
+                total += estimate_text_tokens(json.dumps(tool_calls, ensure_ascii=False, default=str))
+        return total
 
     def as_list(self) -> list[dict[str, Any]]:
         """Return the live message list used by the chat client."""
@@ -211,33 +245,35 @@ class ContextManager:
 
         keep_recent = max(0, int(keep_recent))
         conversation = self.messages[1:]
-        if keep_recent:
-            old_messages = conversation[:-keep_recent]
-            recent_messages = conversation[-keep_recent:]
-        else:
-            old_messages = conversation
-            recent_messages = []
+        if not conversation:
+            return False
+
+        split = persistence.split_for_compaction(conversation, keep_recent)
+        old_messages = conversation[:split]
+        recent_messages = conversation[split:]
 
         if not old_messages:
             return False
 
         summary = str(summarizer(old_messages))
-        summary_message = {
-            "role": "system",
-            "content": f"[Context Summary]\n{summary}",
-        }
 
         if self.task_id:
             try:
-                persistence.compact_branch_dag(
+                result = persistence.compact_branch_dag(
                     self.task_id,
                     summary_text=summary,
                     keep_recent=keep_recent,
                     branch=self.branch,
                 )
+                if isinstance(result, dict) and result.get("summary_content"):
+                    summary = str(result["summary_content"])
             except Exception:
                 pass
 
+        summary_message = {
+            "role": "system",
+            "content": f"[Context Summary]\n{summary}",
+        }
         self.messages = [self.messages[0], summary_message, *recent_messages]
         self._screenshot_indices.clear()
         self._screenshot_paths.clear()

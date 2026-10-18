@@ -6,6 +6,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 import sys
+import time
 import urllib.error
 import urllib.request
 
@@ -41,6 +42,171 @@ def _probe_daemon(base_url: str = "http://127.0.0.1:8765") -> dict | None:
     return None
 
 
+def _daemon_json(
+    method: str,
+    url: str,
+    payload: dict | None = None,
+    timeout: float = 15.0,
+) -> tuple[int, dict]:
+    """One JSON round-trip against the harness daemon; HTTP errors carry their JSON body."""
+    data = json.dumps(payload, ensure_ascii=False).encode("utf-8") if payload is not None else None
+    request = urllib.request.Request(
+        url,
+        data=data,
+        method=method,
+        headers={"Content-Type": "application/json"},
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as resp:
+            raw = resp.read().decode("utf-8")
+            return resp.status, (json.loads(raw) if raw.strip() else {})
+    except urllib.error.HTTPError as err:
+        raw = err.read().decode("utf-8", errors="replace")
+        try:
+            return err.code, json.loads(raw)
+        except Exception:
+            return err.code, {"error": raw.strip()}
+
+
+def _daemon_follow_task(base_url: str, task_id: str) -> int:
+    """Poll one daemon task until it reaches a terminal status, then print the outcome."""
+    detail: dict = {}
+    while True:
+        try:
+            _, detail = _daemon_json("GET", f"{base_url}/tasks/{task_id}")
+        except Exception as e:
+            print(f"daemon poll error: {e}")
+            return 1
+        status = str(detail.get("status", "unknown"))
+        if status != "running":
+            break
+        time.sleep(0.5)
+    print(f"[daemon] {task_id} -> {status}")
+    last = str(detail.get("last_assistant") or "").strip()
+    if last:
+        print(f"assistant: {last}")
+    return 0
+
+
+def _daemon_list_tasks(base_url: str) -> int:
+    try:
+        _, listing = _daemon_json("GET", f"{base_url}/tasks")
+    except Exception as e:
+        print(f"daemon error: {e}")
+        return 1
+    tasks = listing.get("tasks") or []
+    if not tasks:
+        print("no resumable tasks")
+        return 0
+    print("resumable tasks:")
+    for task in tasks:
+        print(
+            f"{task['id']}  created={task.get('created', '')} status={task.get('status', '')} "
+            f"branch={task.get('current_branch', 'main')} messages={task.get('message_count', '')}"
+        )
+    return 0
+
+
+def _run_daemon_client(
+    argv: list[str],
+    resume_requested: bool,
+    resume_task_id: str | None,
+    base_url: str,
+    goal_mode: bool = False,
+) -> int:
+    """Forward this CLI session to the online daemon so disk state has a single writer."""
+    if goal_mode:
+        print("[daemon] note: goal mode is set on the daemon process; forwarding as-is")
+
+    if resume_requested:
+        if not resume_task_id:
+            return _daemon_list_tasks(base_url)
+        code, out = _daemon_json("POST", f"{base_url}/tasks/{resume_task_id}/resume", {})
+        if code != 202:
+            print(f"daemon error: {out.get('error', out)}")
+            return 1
+        return _daemon_follow_task(base_url, resume_task_id)
+
+    if argv:
+        task = " ".join(argv).strip()
+        if not task or task.lower() in ("exit", "quit", "q"):
+            return 0
+        code, out = _daemon_json("POST", f"{base_url}/tasks", {"task": task})
+        if code != 202:
+            print(f"daemon error: {out.get('error', out)}")
+            return 1
+        print(f"[daemon] task: {task}")
+        return _daemon_follow_task(base_url, out["task_id"])
+
+    print(f"\n[Daemon client mode: forwarding to harness at {base_url}. Enter 'exit' to quit.]")
+    while True:
+        try:
+            user = input("\nOperator> ").strip()
+        except (KeyboardInterrupt, EOFError):
+            print("\nbye")
+            return 0
+        if not user:
+            continue
+        if user.lower() in ("exit", "quit", "q"):
+            print("bye")
+            return 0
+        command, _, argument = user.partition(" ")
+        cmd_lower = command.lower()
+        if cmd_lower == "resume":
+            if argument.strip():
+                code, out = _daemon_json("POST", f"{base_url}/tasks/{argument.strip()}/resume", {})
+                if code != 202:
+                    print(f"daemon error: {out.get('error', out)}")
+                else:
+                    _daemon_follow_task(base_url, argument.strip())
+            else:
+                _daemon_list_tasks(base_url)
+            continue
+        if cmd_lower == "queue":
+            if argument.strip():
+                code, out = _daemon_json(
+                    "POST", f"{base_url}/queue", {"content": argument.strip(), "source": "cli"}
+                )
+                if code == 201:
+                    print(f"queued {(out.get('item') or {}).get('id', '?')}")
+                else:
+                    print(f"daemon error: {out.get('error', out)}")
+            else:
+                _code, out = _daemon_json("GET", f"{base_url}/queue")
+                items = out.get("queue") or []
+                if not items:
+                    print("queue empty")
+                for item in items:
+                    print(
+                        f"[{item['id']}] prio={item.get('priority')} "
+                        f"status={item.get('status')}: {item.get('content')}"
+                    )
+            continue
+        if cmd_lower == "interrupt":
+            code, out = _daemon_json(
+                "POST",
+                f"{base_url}/interrupt",
+                {"reason": argument.strip() or "CLI operator interrupt", "source": "cli"},
+            )
+            if code == 200:
+                print(f"abort.flag set for {out.get('task_id', '?')}")
+            else:
+                print(f"daemon error: {out.get('error', out)}")
+            continue
+        if cmd_lower == "reload":
+            code, out = _daemon_json("POST", f"{base_url}/reload", {})
+            if code == 200:
+                print(f"skills reloaded ({out.get('skills', '?')} tools)")
+            else:
+                print(f"daemon error: {out.get('error', out)}")
+            continue
+        code, out = _daemon_json("POST", f"{base_url}/tasks", {"task": user})
+        if code != 202:
+            print(f"daemon busy: {out.get('error', out)}")
+            continue
+        _daemon_follow_task(base_url, out["task_id"])
+
+
 def main(argv: list[str] | None = None) -> int:
     argv = list(sys.argv[1:] if argv is None else argv)
 
@@ -68,6 +234,10 @@ def main(argv: list[str] | None = None) -> int:
         argv.pop(resume_index)
         if resume_index < len(argv) and not argv[resume_index].startswith("-"):
             resume_task_id = argv.pop(resume_index)
+
+    daemon_url = "http://127.0.0.1:8765"
+    if _probe_daemon(daemon_url) is not None:
+        return _run_daemon_client(argv, resume_requested, resume_task_id, daemon_url, goal_mode=goal_mode)
 
     config = load_config()
     logger = setup_logger(log_level=config.log_level)
