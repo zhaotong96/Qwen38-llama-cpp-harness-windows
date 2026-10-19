@@ -9,6 +9,7 @@ import json
 import os
 from pathlib import Path
 import queue
+import re
 import sys
 import threading
 import time
@@ -23,7 +24,10 @@ from core.config import AgentConfig, load_config, record_usage
 from core.context import ContextManager
 from core.interrupt import (
     consume_abort_flag,
+    consume_step_continue,
+    get_step_mode,
     is_step_rejected,
+    wait_for_step_continue,
     write_step_state,
 )
 from core.logger import setup_logger
@@ -144,6 +148,12 @@ class FileAndSseObserver:
 
 class Agent:
     """Core Agent class encapsulating conversation loop, skill dispatch, and execution state."""
+
+    RISKY_TOOLS = frozenset(
+        {"shell", "write_file", "patch", "git", "mouse", "keyboard", "subagent", "add_skill", "modify_skill"}
+    )
+    READ_TIMEOUT_BASE = 300.0
+    READ_TIMEOUT_TOKENS_PER_SECOND = 400
 
     def __init__(
         self,
@@ -294,7 +304,10 @@ class Agent:
                         "MODEL": self.config.model,
                         "CHAT_EXTRA": self.config.chat_extra,
                         "MAX_TOKENS": self.config.max_gen_tokens,
-                        "parent_task_id": self.current_task_id,
+                        "task_id": self.current_task_id,
+                        "parent_task_id": self.parent_task_id or self.current_task_id,
+                        "tasks_root": self._tasks_root,
+                        "parent_tasks_root": self.parent_tasks_root,
                     }
                     return m.run(args, runtime)
 
@@ -321,6 +334,52 @@ class Agent:
                 cascaded["reason"] = f"Cascaded abort from parent task {self.parent_task_id}: {parent_info.get('reason', '')}"
                 return cascaded
         return None
+
+    def _should_pause_before_tool(self, tool_name: str) -> bool:
+        """Decide whether the pre-dispatch risk gate must stop before this tool."""
+        if not self.current_task_id:
+            return False
+        mode = get_step_mode(self.current_task_id, base_root=self._tasks_root)
+        if mode == "step_all":
+            return True
+        if mode == "step_risky":
+            return tool_name in self.RISKY_TOOLS
+        return False
+
+    def _pause_for_operator(self, step_id: str, round_i: int, tool_name: str) -> dict[str, Any] | None:
+        """Persist paused_before_tool and block until release or abort.
+
+        Returns abort info when the operator rejected, otherwise None.
+        """
+        if not self.current_task_id:
+            return None
+        write_step_state(
+            self.current_task_id,
+            step_id,
+            round_i,
+            phase="paused_before_tool",
+            rejected=False,
+            active_tool=tool_name,
+            base_root=self._tasks_root,
+        )
+        self.observer.emit(
+            self.current_task_id,
+            "step_phase",
+            {"phase": "paused_before_tool", "round": round_i, "tool": tool_name},
+            step_id=step_id,
+            tasks_root=self._tasks_root,
+        )
+        self.logger.info(f"[step-gate] paused before tool '{tool_name}'; awaiting step_continue.flag")
+        abort_info = wait_for_step_continue(self.current_task_id, base_root=self._tasks_root)
+        if abort_info is None:
+            self.observer.emit(
+                self.current_task_id,
+                "step_phase",
+                {"phase": "step_released", "round": round_i, "tool": tool_name},
+                step_id=step_id,
+                tasks_root=self._tasks_root,
+            )
+        return abort_info
 
     def _consume_inbox(self) -> list[str]:
         """Consume operator messages from both legacy .agent/inbox/ and unified .agent/queue/."""
@@ -368,6 +427,15 @@ class Agent:
 
         return notes
 
+    def _adaptive_read_timeout(self) -> float:
+        """Scale the HTTP read timeout with the live context size.
+
+        A large-context prefill on the remote host can legitimately exceed a
+        fixed client timeout; scaling with the token estimate keeps long
+        interactions from being cut off as false failures.
+        """
+        return self.READ_TIMEOUT_BASE + self.context.token_estimate() / self.READ_TIMEOUT_TOKENS_PER_SECOND
+
     def chat(self, tool_choice: str = "auto"):
         # Dynamic generation cap: never exceed the remaining window space.
         gen_cap = min(
@@ -385,6 +453,7 @@ class Agent:
             max_tokens=gen_cap,
             stream=True,
             extra_body=self.config.chat_extra,
+            timeout=self._adaptive_read_timeout(),
         )
         last_err: Exception | None = None
         for attempt in range(1, 9):
@@ -546,34 +615,178 @@ class Agent:
         "5. 待完成子目标与下一步行动\n"
     )
 
+    _REDLINE_MARKERS = (
+        "[Operator correction]",
+        "[EXECUTION_REJECTED]",
+        "[EXECUTION_INTERRUPTED_AND_IGNORED]",
+    )
+    _SECTION4_HEADING = "4. 被否决方案与操作员红线（永久保留）"
+    _REDLINE_PLACEHOLDERS = frozenset({"无", "none", "n/a", "(none)", "-"})
+
+    @staticmethod
+    def _strip_archived_index(content: str) -> str:
+        """Drop the legacy section 6 index table before sending history to the LLM."""
+        marker = "\n\n6. 已归档原始 DAG 节点索引表"
+        if marker in content:
+            return content.split(marker, 1)[0]
+        return content
+
+    @staticmethod
+    def _ledger_section(content: str, number: int) -> str:
+        """Return the body of numbered ledger section ``number`` (empty when absent)."""
+        match = re.search(rf"(?m)^\s*{number}\.\s.*$", content)
+        if not match:
+            return ""
+        start = match.end()
+        next_match = re.search(rf"(?m)^\s*{number + 1}\.\s", content[start:])
+        end = start + next_match.start() if next_match else len(content)
+        return content[start:end]
+
+    @classmethod
+    def _extract_pinned_redlines(cls, messages: list[dict[str, Any]]) -> list[str]:
+        """Collect every operator redline verbatim from prior ledgers and this window."""
+        pins: list[str] = []
+
+        def add(line: str) -> None:
+            value = line.strip()
+            while value.startswith(("- ", "* ")):
+                value = value[2:].strip()
+            if value and value not in pins:
+                pins.append(value)
+
+        for message in messages:
+            content = message.get("content")
+            if not isinstance(content, str):
+                continue
+            if content.startswith("[Context Summary]"):
+                for line in cls._ledger_section(content, 4).splitlines():
+                    value = line.strip().lstrip("-* ").strip()
+                    if value and value.lower() not in cls._REDLINE_PLACEHOLDERS:
+                        add(value)
+                continue
+            for marker in cls._REDLINE_MARKERS:
+                if marker not in content:
+                    continue
+                if marker == "[Operator correction]":
+                    for block in content.split(marker)[1:]:
+                        tail = " ".join(block.strip().split())
+                        while tail.startswith(marker):
+                            tail = tail[len(marker):].strip()
+                        if tail:
+                            add(f"{marker} {tail}")
+                    continue
+                for line in content.splitlines():
+                    if marker in line:
+                        add(line)
+        return pins
+
+    def _can_prefix_share(self, messages: list[dict[str, Any]]) -> bool:
+        """True when the compactor reuses the main slot and the prefix is still live."""
+        comp_cfg = self.compactor_config or self.config
+        if (comp_cfg.base_url, comp_cfg.model) != (self.config.base_url, self.config.model):
+            return False
+        prefix_len = len(messages) + 1
+        if len(self.messages) < prefix_len:
+            return False
+        prefix = self.messages[:prefix_len]
+        if prefix[0].get("role") != "system":
+            return False
+        for live, folded in zip(prefix[1:], messages):
+            live_content = live.get("content")
+            folded_content = folded.get("content")
+            if isinstance(live_content, str) and live_content.startswith("[Context Summary]"):
+                live_content = self._strip_archived_index(live_content)
+            if isinstance(folded_content, str) and folded_content.startswith("[Context Summary]"):
+                folded_content = self._strip_archived_index(folded_content)
+            if live_content != folded_content or live.get("role") != folded.get("role"):
+                return False
+        return True
+
+    @classmethod
+    def _enforce_redlines(cls, summary: str, pinned: list[str]) -> str:
+        """Guarantee every pinned redline survives verbatim in ledger section 4."""
+        if not pinned:
+            return summary
+        heading = cls._SECTION4_HEADING
+        if heading not in summary:
+            summary = summary.rstrip() + f"\n\n{heading}\n"
+        section4 = cls._ledger_section(summary, 4)
+        missing = [pin for pin in pinned if pin not in section4]
+        if not missing:
+            return summary
+        additions = "\n".join(f"- {pin}" for pin in missing)
+        section4_start = summary.find(heading) + len(heading)
+        next_heading = re.search(r"(?m)^\s*5\.\s", summary[section4_start:])
+        if next_heading:
+            insert_at = section4_start + next_heading.start()
+            head = summary[:insert_at].rstrip()
+            tail = summary[insert_at:]
+            return f"{head}\n{additions}\n\n{tail}"
+        return summary.rstrip() + "\n" + additions + "\n"
+
     def _summarize(self, messages: list[dict[str, Any]]) -> str:
-        """Ask the configured compactor model for a five-section Chinese fact ledger."""
-        history = json.dumps(messages, ensure_ascii=False, default=str)
-        prompt = f"{self._LEDGER_INSTRUCTION}\n对话历史（JSON）：\n{history}"
+        """Ask the compactor for a five-section ledger with deterministic redline retention."""
+        pinned_redlines = self._extract_pinned_redlines(messages)
+        redline_block = ""
+        if pinned_redlines:
+            redline_block = (
+                "\n<immutable_redlines>\n"
+                + "\n".join(pinned_redlines)
+                + "\n</immutable_redlines>\n"
+                "第 4 节必须逐字原样保留上述每一条红线，禁止改写、合并或删除。\n"
+            )
+        instruction = self._LEDGER_INSTRUCTION + redline_block
+
         comp_cfg = self.compactor_config or self.config
         comp_client = self.compactor_client if (self.compactor_client is not None and comp_cfg is not self.config) else self.client
         extra_body = dict(comp_cfg.chat_extra or {})
         template_kwargs = dict(extra_body.get("chat_template_kwargs") or {})
         template_kwargs["enable_thinking"] = False
         extra_body["chat_template_kwargs"] = template_kwargs
+
+        if self._can_prefix_share(messages):
+            prefix = [dict(m) for m in self.messages[: len(messages) + 1]]
+            request_messages = [*prefix, {"role": "user", "content": instruction}]
+            extra_body["id_slot"] = 0
+        else:
+            if "id_slot" in extra_body:
+                preferred_slot = int(extra_body["id_slot"])
+                available_slot = config_mod.select_available_slot(
+                    comp_cfg.base_url, preferred=preferred_slot
+                )
+                if available_slot is not None:
+                    extra_body["id_slot"] = available_slot
+            cleaned: list[dict[str, Any]] = []
+            for message in messages:
+                item = dict(message)
+                content = item.get("content")
+                if isinstance(content, str) and content.startswith("[Context Summary]"):
+                    item["content"] = self._strip_archived_index(content)
+                cleaned.append(item)
+            history = json.dumps(cleaned, ensure_ascii=False, default=str)
+            prompt = f"{instruction}\n对话历史（JSON）：\n{history}"
+            request_messages = [{"role": "user", "content": prompt}]
+
         response = comp_client.chat.completions.create(
             model=comp_cfg.model,
-            messages=[{"role": "user", "content": prompt}],
+            messages=request_messages,
             temperature=0.2,
             max_tokens=2048,
             stream=False,
             extra_body=extra_body,
+            timeout=self._adaptive_read_timeout(),
         )
         message = response.choices[0].message
         summary = (getattr(message, "content", None) or "").strip()
         if not summary:
             summary = (getattr(message, "reasoning_content", None) or "").strip()
+        summary = self._enforce_redlines(summary, pinned_redlines)
         try:
             record_usage(
                 role="compactor",
                 model=comp_cfg.model,
                 base_url=comp_cfg.base_url,
-                input_tokens=len(prompt) // 4,
+                input_tokens=sum(len(str(m.get("content", ""))) for m in request_messages) // 4,
                 output_tokens=len(summary) // 4,
                 price_per_1m_input=comp_cfg.price_per_1m_input,
                 price_per_1m_output=comp_cfg.price_per_1m_output,
@@ -808,6 +1021,33 @@ class Agent:
                     sig = f"{name}:{json.dumps(args, sort_keys=True, ensure_ascii=False)}"
                     round_sigs.append(sig)
                     self.logger.info(f"-> {name}({json.dumps(args, ensure_ascii=False)[:200]})")
+
+                    # Pre-Dispatch Operator Breakpoint (step_risky / step_all)
+                    if self._should_pause_before_tool(name):
+                        pause_abort = self._pause_for_operator(step_id, round_i, name)
+                        if pause_abort is not None:
+                            step_was_aborted = True
+                            abort_info = pause_abort
+                            src = str(pause_abort.get("source", "operator")).upper()
+                            reason = str(pause_abort.get("reason", "User interrupted"))
+                            reject_msg = (
+                                f"[EXECUTION_REJECTED] [REJECTED_BY_{src}] "
+                                f"Tool '{name}' execution was refused at the step breakpoint: {reason}"
+                            )
+                            self.logger.warning(f"<- [step-gate-abort] {reject_msg}")
+                            with self._scoped_persistence():
+                                self.context.append(
+                                    {"role": "tool", "tool_call_id": tc.id, "content": reject_msg},
+                                    meta={"step_id": step_id, "rejected": True},
+                                )
+                            self.observer.emit(
+                                self.current_task_id,
+                                "tool_rejected",
+                                {"tool": name, "tool_call_id": tc.id, "reason": reason, "source": src},
+                                step_id=step_id,
+                                tasks_root=self._tasks_root,
+                            )
+                            continue
 
                     if self.current_task_id:
                         write_step_state(

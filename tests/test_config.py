@@ -84,6 +84,52 @@ class SlotAffinityTests(unittest.TestCase):
         self.assertEqual(resolved["chat_extra"]["id_slot"], 5)
 
 
+class SlotProbeTests(unittest.TestCase):
+    """Live /slots probing routes compactor/subagent work around external jobs."""
+
+    @staticmethod
+    def _urlopen(payload):
+        response = mock.MagicMock()
+        response.read.return_value = json.dumps(payload).encode()
+        response.__enter__ = mock.MagicMock(return_value=response)
+        response.__exit__ = mock.MagicMock(return_value=False)
+        return mock.MagicMock(return_value=response)
+
+    def test_busy_preferred_slot_routes_to_idle_slot(self):
+        payload = [
+            {"id": 0, "is_processing": True},
+            {"id": 1, "is_processing": True},
+            {"id": 2, "is_processing": False},
+        ]
+        with mock.patch("urllib.request.urlopen", self._urlopen(payload)):
+            self.assertEqual(config_mod.select_available_slot("http://x:8080/v1", preferred=1), 2)
+
+    def test_idle_preferred_slot_is_kept(self):
+        payload = [{"id": 0, "is_processing": True}, {"id": 1, "is_processing": False}]
+        with mock.patch("urllib.request.urlopen", self._urlopen(payload)):
+            self.assertEqual(config_mod.select_available_slot("http://x:8080/v1", preferred=1), 1)
+
+    def test_all_non_main_slots_busy_returns_none(self):
+        payload = [{"id": 0, "is_processing": False}, {"id": 1, "is_processing": True}]
+        with mock.patch("urllib.request.urlopen", self._urlopen(payload)):
+            self.assertIsNone(config_mod.select_available_slot("http://x:8080/v1", preferred=1))
+
+    def test_probe_failure_keeps_preferred_slot(self):
+        with mock.patch("urllib.request.urlopen", side_effect=OSError("refused")):
+            self.assertEqual(config_mod.select_available_slot("http://x/v1", preferred=1), 1)
+
+    def test_probe_strips_v1_suffix_and_accepts_wrapped_payload(self):
+        captured = {}
+
+        def fake_urlopen(url, timeout=None):
+            captured["url"] = url
+            return self._urlopen({"slots": [{"id": 0, "is_processing": True}]})()
+
+        with mock.patch("urllib.request.urlopen", fake_urlopen):
+            self.assertIsNone(config_mod.select_available_slot("http://x:8080/v1", preferred=0))
+        self.assertEqual(captured["url"], "http://x:8080/slots")
+
+
 class LoadConfigTests(unittest.TestCase):
     def setUp(self):
         config_mod.reset_probe_cache()

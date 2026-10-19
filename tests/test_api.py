@@ -193,12 +193,53 @@ class TaskEndpointTests(ApiCase):
 
 class WebConsoleAndSseGatewayTests(ApiCase):
     def test_static_web_console_files_served(self):
-        for rel in ("/web/index.html", "/web/app.js", "/web/tree_view.js", "/web/queue_panel.js", "/web/styles.css"):
+        for rel in ("/web/index.html", "/web/app.js", "/web/tree_view.js", "/web/queue_panel.js",
+                    "/web/fact_ledger.js", "/web/inspector.js", "/web/styles.css"):
             req = urllib.request.Request(self.base + rel, method="GET")
             with urllib.request.urlopen(req, timeout=10) as resp:
                 self.assertEqual(resp.status, 200)
                 body = resp.read().decode("utf-8")
                 self.assertTrue(len(body) > 50)
+
+    def test_index_contains_fact_ledger_and_inspector(self):
+        req = urllib.request.Request(self.base + "/web/index.html", method="GET")
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            body = resp.read().decode("utf-8")
+        self.assertIn('id="fact-ledger-card"', body)
+        self.assertIn('id="whitebox-inspector-drawer"', body)
+        self.assertIn('id="step-mode-select"', body)
+        self.assertIn('id="btn-step-continue"', body)
+
+    def test_styles_use_content_visibility(self):
+        req = urllib.request.Request(self.base + "/web/styles.css", method="GET")
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            body = resp.read().decode("utf-8")
+        self.assertIn("content-visibility: auto", body)
+        self.assertIn("contain-intrinsic-size", body)
+
+    def test_step_mode_and_continue_endpoints(self):
+        persistence.save_checkpoint("step_api_task", [{"role": "user", "content": "go"}])
+        code, payload = call(self.base, "GET", "/tasks/step_api_task/step_mode")
+        self.assertEqual(code, 200)
+        self.assertEqual(payload["step_mode"], "auto")
+
+        code, payload = call(self.base, "POST", "/tasks/step_api_task/step_mode", {"mode": "step_risky"})
+        self.assertEqual(code, 200)
+        self.assertEqual(payload["step_mode"], "step_risky")
+        self.assertEqual(
+            (self.tasks_root / "step_api_task" / "step_mode").read_text(encoding="utf-8").strip(),
+            "step_risky",
+        )
+
+        code, payload = call(self.base, "POST", "/tasks/step_api_task/step_mode", {"mode": "yolo"})
+        self.assertEqual(code, 400)
+
+        code, payload = call(self.base, "POST", "/tasks/step_api_task/step_continue", {})
+        self.assertEqual(code, 200)
+        self.assertTrue((self.tasks_root / "step_api_task" / "step_continue.flag").is_file())
+
+        code, tree = call(self.base, "GET", "/tasks/step_api_task/tree")
+        self.assertEqual(tree["step_mode"], "step_risky")
 
     def test_sse_events_and_providers_endpoints(self):
         code, submitted = call(self.base, "POST", "/tasks", {"task": "stream test"})

@@ -124,6 +124,16 @@ class ChatHyperparameterTests(IsolatedCase):
         self.assertEqual(kwargs["temperature"], 0.2)
         self.assertEqual(kwargs["top_p"], 0.95)
 
+    def test_read_timeout_scales_with_context_size(self):
+        agent, llm = build_agent([{"content": "text only"}])
+        agent.chat()
+        baseline = llm.requests[-1]["timeout"]
+        self.assertGreaterEqual(baseline, agent.READ_TIMEOUT_BASE)
+
+        agent.context.append({"role": "user", "content": "x" * 40000})
+        agent.chat()
+        self.assertGreater(llm.requests[-1]["timeout"], baseline)
+
     def test_chat_extra_carries_mtp_friendly_defaults(self):
         agent, llm = build_agent([{"content": "text only"}])
         agent.chat()
@@ -150,6 +160,101 @@ class FactLedgerSummaryTests(IsolatedCase):
         for section in ("1. 核心目标与进度", "2. 已验证事实与环境基线", "3. 已修改文件清单",
                         "4. 被否决方案与操作员红线（永久保留）", "5. 待完成子目标与下一步行动"):
             self.assertIn(section, prompt)
+
+
+class RedlineFidelityTests(IsolatedCase):
+    REDLINE = "[Operator correction] NEVER touch the production slot; keep BENCH_SECRET_PORT=49152"
+
+    @staticmethod
+    def _ledger_without_redlines(note: str = "done") -> str:
+        return (
+            "1. 核心目标与进度\n" + note + "\n\n"
+            "2. 已验证事实与环境基线\nok\n\n"
+            "3. 已修改文件清单\nnone\n\n"
+            "4. 被否决方案与操作员红线（永久保留）\n无\n\n"
+            "5. 待完成子目标与下一步行动\ncontinue"
+        )
+
+    def test_old_section_six_is_stripped_before_summarization(self):
+        agent, llm = build_agent([{"content": "summary"}])
+        legacy = (
+            "[Context Summary]\n1. 核心目标与进度\nx\n\n"
+            "6. 已归档原始 DAG 节点索引表（可用 read_checkpoint_node 按 node_id 回溯原文）\n"
+            "- n_000001 (user): secret [10 chars]"
+        )
+        agent._summarize([{"role": "system", "content": legacy}])
+        prompt = llm.requests[-1]["messages"][0]["content"]
+        self.assertIn("核心目标与进度", prompt)
+        self.assertNotIn("已归档原始 DAG 节点索引表", prompt)
+
+    def test_redlines_survive_three_cascaded_compactions_verbatim(self):
+        agent, llm = build_agent([{"content": self._ledger_without_redlines()} for _ in range(3)])
+        history = [{"role": "user", "content": self.REDLINE}]
+        for round_i in range(1, 4):
+            summary = agent._summarize(history)
+            self.assertIn(self.REDLINE, summary, f"redline lost at round {round_i}")
+            self.assertIn("4. 被否决方案与操作员红线（永久保留）", summary)
+            history = [
+                {"role": "system", "content": f"[Context Summary]\n{summary}"},
+                {"role": "user", "content": f"round {round_i} work"},
+            ]
+
+        final = history[0]["content"]
+        self.assertIn("BENCH_SECRET_PORT=49152", final)
+        self.assertIn("NEVER touch the production slot", final)
+        self.assertEqual(llm.requests[-1]["messages"][0]["role"], "user")
+
+    def test_redline_block_is_injected_into_instruction(self):
+        agent, llm = build_agent([{"content": self._ledger_without_redlines()}])
+        agent._summarize([{"role": "user", "content": self.REDLINE}])
+        prompt = llm.requests[-1]["messages"][0]["content"]
+        self.assertIn("<immutable_redlines>", prompt)
+        self.assertIn("BENCH_SECRET_PORT=49152", prompt)
+
+    def test_redlines_inserted_inside_section_four_when_heading_precedes_section_five(self):
+        malformed = (
+            "1. 核心目标与进度\nx\n\n"
+            "5. 待完成子目标与下一步行动\ncontinue\n\n"
+            "4. 被否决方案与操作员红线（永久保留）\n无\n"
+        )
+        agent, _ = build_agent([{"content": malformed}])
+        summary = agent._summarize([{"role": "user", "content": self.REDLINE}])
+
+        self.assertIn(self.REDLINE, summary)
+        self.assertIn("5. 待完成子目标与下一步行动", summary)
+        self.assertLess(summary.index("4. 被否决方案"), summary.index(self.REDLINE))
+
+    def test_prefix_sharing_reuses_live_slot_zero_prefix(self):
+        agent, llm = build_agent([{"content": self._ledger_without_redlines()}])
+        agent.context.append({"role": "user", "content": "first turn"})
+        agent.context.append({"role": "assistant", "content": "first reply"})
+
+        agent._summarize([{"role": "user", "content": "first turn"}])
+
+        request = llm.requests[-1]
+        self.assertEqual(request["extra_body"]["id_slot"], 0)
+        self.assertEqual(len(request["messages"]), 3)
+        self.assertEqual(request["messages"][0]["role"], "system")
+        self.assertEqual(request["messages"][1]["content"], "first turn")
+        self.assertEqual(request["messages"][2]["role"], "user")
+        self.assertIn("1. 核心目标与进度", request["messages"][2]["content"])
+        self.assertNotIn("对话历史（JSON）", request["messages"][2]["content"])
+
+    def test_prefix_sharing_disabled_for_asymmetric_compactor(self):
+        agent, llm = build_agent([{"content": self._ledger_without_redlines()}])
+        agent.context.append({"role": "user", "content": "first turn"})
+        agent.compactor_config = type(agent.config)(
+            base_url="http://other.example/v1",
+            model="other-model",
+        )
+        agent.compactor_client = llm
+
+        agent._summarize([{"role": "user", "content": "first turn"}])
+
+        request = llm.requests[-1]
+        self.assertNotIn("id_slot", request["extra_body"])
+        self.assertEqual(len(request["messages"]), 1)
+        self.assertIn("对话历史（JSON）", request["messages"][0]["content"])
 
 
 class RunTaskTests(IsolatedCase):

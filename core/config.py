@@ -243,6 +243,58 @@ def _probe_window(base_url: str, model: str = "", fallback: int = FALLBACK_N_CTX
     return n_ctx
 
 
+def _server_root(base_url: str) -> str:
+    """Strip the OpenAI-compatible ``/v1`` suffix to reach llama.cpp server routes."""
+    url = (base_url or "").rstrip("/")
+    if url.endswith("/v1"):
+        url = url[: -len("/v1")]
+    return url
+
+
+def probe_slots(base_url: str, timeout: float = 0.5) -> list[dict[str, Any]] | None:
+    """Probe llama.cpp's ``GET /slots``; None when unreachable or unsupported."""
+    try:
+        import urllib.request
+
+        with urllib.request.urlopen(_server_root(base_url) + "/slots", timeout=timeout) as resp:
+            payload = json.loads(resp.read())
+    except Exception:
+        return None
+    if isinstance(payload, dict):
+        payload = payload.get("slots")
+    if not isinstance(payload, list):
+        return None
+    return [slot for slot in payload if isinstance(slot, dict)]
+
+
+def select_available_slot(
+    base_url: str,
+    preferred: int = 1,
+    timeout: float = 0.5,
+) -> int | None:
+    """Return a usable non-main slot, or None when every non-main slot is busy.
+
+    A failed probe (old server without ``/slots``, or a non-llama.cpp endpoint)
+    keeps the configured preferred slot: fail-open preserves compatibility.
+    """
+    slots = probe_slots(base_url, timeout=timeout)
+    if slots is None:
+        return preferred
+    by_id: dict[int, dict[str, Any]] = {}
+    for slot in slots:
+        slot_id = slot.get("id")
+        if isinstance(slot_id, int):
+            by_id[slot_id] = slot
+    preferred_slot = by_id.get(preferred)
+    if preferred_slot is not None and not preferred_slot.get("is_processing"):
+        return preferred
+    for slot_id in sorted(by_id):
+        if slot_id == 0 or by_id[slot_id].get("is_processing"):
+            continue
+        return slot_id
+    return None
+
+
 def load_config(role: str = "main", providers_path: Path | None = None) -> AgentConfig:
     """Build the runtime configuration shared by the CLI and the HTTP API.
 

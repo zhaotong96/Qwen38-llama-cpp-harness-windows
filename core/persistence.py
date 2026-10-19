@@ -826,6 +826,97 @@ def _node_preview(node: dict[str, Any], limit: int = 60) -> str:
     return "[" + str(node.get("role", "?")) + " message]"
 
 
+INDEX_SECTION_HEADER = "6. 已归档原始 DAG 节点索引表（可用 read_checkpoint_node 按 node_id 回溯原文）"
+MAX_INDEX_LINES = 30
+MAX_EPOCH_INDEX_LINES = 4
+_ERROR_KEYWORDS = ("error", "traceback", "exception", "failed", "失败", "报错")
+_INDEX_ENTRY_PATTERN = re.compile(r"^-\s+((?:n_\d+_[A-Za-z0-9]+)|(?:legacy_\d+))\b")
+
+
+def _epoch_range(node: dict[str, Any]) -> tuple[str, str]:
+    """Return the first/last archived node ids recorded inside a compaction node."""
+    content = node.get("content")
+    node_id = str(node.get("id", "?"))
+    ids: list[str] = []
+    if isinstance(content, str):
+        for line in content.splitlines():
+            if "compaction-epoch" in line:
+                continue
+            match = _INDEX_ENTRY_PATTERN.match(line.strip())
+            if match and match.group(1) != node_id:
+                ids.append(match.group(1))
+    if ids:
+        return ids[0], ids[-1]
+    return node_id, node_id
+
+
+def _ordinary_importance(node: dict[str, Any], position: int) -> tuple[int, int]:
+    """Rank archived ordinary nodes: errors and operator turns outrank chatter."""
+    score = 0
+    if node.get("tool_calls"):
+        score += 3
+    if node.get("role") == "user":
+        score += 3
+    clean = strip_dag_envelope(node)
+    serialized = json.dumps(clean, ensure_ascii=False, default=str)
+    if any(keyword in serialized.lower() for keyword in _ERROR_KEYWORDS):
+        score += 2
+    if len(serialized) > 500:
+        score += 1
+    return score, position
+
+
+def _build_index_lines(old_nodes: list[dict[str, Any]]) -> list[str]:
+    """Build a bounded epoch-aware index table: header plus <=29 entry lines."""
+    epochs = [node for node in old_nodes if node.get("type") == "compaction"]
+    ordinary = [node for node in old_nodes if node.get("type") != "compaction"]
+
+    lines: list[str] = [INDEX_SECTION_HEADER]
+
+    if len(epochs) > MAX_EPOCH_INDEX_LINES - 1:
+        merged = epochs[: len(epochs) - (MAX_EPOCH_INDEX_LINES - 1)]
+        epochs = epochs[-(MAX_EPOCH_INDEX_LINES - 1):]
+        first_id, _ = _epoch_range(merged[0])
+        _, last_id = _epoch_range(merged[-1])
+        lines.append(
+            f"- (compaction-epochs): [更早 {len(merged)} 个压缩纪元: {first_id}..{last_id}，"
+            "调用 read_checkpoint_node 可展开]"
+        )
+    for node in epochs:
+        first_id, last_id = _epoch_range(node)
+        lines.append(
+            f"- {node.get('id')} (compaction-epoch): [历史压缩账本快照: 内含早期节点 "
+            f"{first_id}..{last_id} 二级索引，调用 read_checkpoint_node 可展开]"
+        )
+
+    budget = max(0, MAX_INDEX_LINES - len(lines))
+    ranked = sorted(
+        ((_ordinary_importance(node, pos), pos) for pos, node in enumerate(ordinary)),
+        key=lambda item: (-item[0][0], item[0][1]),
+    )
+    if len(ordinary) <= budget:
+        selected = set(range(len(ordinary)))
+        overflow = 0
+    else:
+        keep = max(0, budget - 1)
+        selected = {pos for _, pos in ranked[:keep]}
+        overflow = len(ordinary) - len(selected)
+
+    for pos, node in enumerate(ordinary):
+        if pos not in selected:
+            continue
+        clean = strip_dag_envelope(node)
+        char_count = len(json.dumps(clean, ensure_ascii=False, default=str))
+        lines.append(
+            f"- {node.get('id')} ({node.get('role', '?')}): {_node_preview(clean)} [{char_count} chars]"
+        )
+    if overflow:
+        lines.append(
+            f"- ({overflow} 个次要节点已并入本纪元，可用 read_checkpoint_node 回溯原文)"
+        )
+    return lines
+
+
 def compact_branch_dag(
     task_id: str,
     summary_text: str,
@@ -853,13 +944,7 @@ def compact_branch_dag(
     if not old_nodes:
         return None
 
-    index_lines = ["6. 已归档原始 DAG 节点索引表（可用 read_checkpoint_node 按 node_id 回溯原文）"]
-    for node in old_nodes:
-        clean = strip_dag_envelope(node)
-        char_count = len(json.dumps(clean, ensure_ascii=False, default=str))
-        index_lines.append(
-            f"- {node.get('id')} ({node.get('role', '?')}): {_node_preview(clean)} [{char_count} chars]"
-        )
+    index_lines = _build_index_lines(old_nodes)
     summary_content = summary_text.rstrip() + "\n\n" + "\n".join(index_lines)
 
     summary_msg = {
@@ -915,6 +1000,10 @@ def get_task_tree(task_id: str) -> dict[str, Any] | None:
             step_state = json.loads(step_state_path.read_text(encoding="utf-8"))
         except Exception:
             step_state = None
+    step_mode_path = _task_directory(task_id) / "step_mode"
+    step_mode = (_read_text_tolerant(step_mode_path) or "").strip().lower() or "auto"
+    if step_mode not in ("auto", "step_risky", "step_all"):
+        step_mode = "auto"
     return {
         "task_id": task_id,
         "status": status or "unknown",
@@ -924,6 +1013,7 @@ def get_task_tree(task_id: str) -> dict[str, Any] | None:
         "nodes": nodes,
         "metadata": metadata,
         "step_state": step_state,
+        "step_mode": step_mode,
     }
 
 
@@ -946,35 +1036,89 @@ def generate_task_id() -> str:
     return datetime.now().strftime("%Y%m%d_%H%M%S_%f")
 
 
+_TASK_SUMMARY_CACHE: dict[str, tuple[tuple[int, ...], dict[str, Any]]] = {}
+_TASK_SUMMARY_CACHE_LOCK = threading.Lock()
+
+
+def clear_task_summary_cache() -> None:
+    """Drop cached task summaries (tests and external state rewrites)."""
+    with _TASK_SUMMARY_CACHE_LOCK:
+        _TASK_SUMMARY_CACHE.clear()
+
+
+def _task_signature(task_directory: Path) -> tuple[int, ...]:
+    """Build an mtime/size signature for the files that shape a task summary."""
+    signature: list[int] = []
+    for name in (CHECKPOINT_FILE, STATUS_FILE, CURRENT_BRANCH_FILE):
+        path = task_directory / name
+        try:
+            stat = path.stat()
+        except OSError:
+            signature.extend((0, 0))
+            continue
+        signature.extend((stat.st_mtime_ns, stat.st_size))
+    for name in (BRANCHES_DIR, TAGS_DIR):
+        directory = task_directory / name
+        try:
+            stat = directory.stat()
+        except OSError:
+            signature.extend((0, 0))
+            continue
+        signature.extend((stat.st_mtime_ns, stat.st_size))
+    return tuple(signature)
+
+
+def _summarize_task(task_directory: Path) -> dict[str, Any] | None:
+    """Read one task directory into its list_tasks projection."""
+    loaded = load_checkpoint(task_directory.name)
+    if loaded is None:
+        return None
+    messages, _ = loaded
+    try:
+        stat = (task_directory / CHECKPOINT_FILE).stat()
+    except OSError:
+        return None
+    return {
+        "id": task_directory.name,
+        "created": datetime.fromtimestamp(stat.st_mtime).isoformat(timespec="seconds"),
+        "status": load_status(task_directory.name) or "unknown",
+        "message_count": len(messages),
+        "current_branch": get_current_branch(task_directory.name),
+        "branches": list(list_branches(task_directory.name).keys()) or [DEFAULT_BRANCH],
+    }
+
+
 def list_tasks() -> list[dict[str, Any]]:
     """List task checkpoints with creation time, message counts, branches, and status."""
     if not TASKS_ROOT.is_dir():
+        clear_task_summary_cache()
         return []
 
     tasks: list[dict[str, Any]] = []
+    seen: set[str] = set()
     for task_directory in TASKS_ROOT.iterdir():
         if not task_directory.is_dir() or not _TASK_ID_PATTERN.fullmatch(task_directory.name):
             continue
         checkpoint = task_directory / CHECKPOINT_FILE
         if not checkpoint.is_file():
             continue
-        loaded = load_checkpoint(task_directory.name)
-        if loaded is None:
+        cache_key = str(task_directory)
+        seen.add(cache_key)
+        signature = _task_signature(task_directory)
+        with _TASK_SUMMARY_CACHE_LOCK:
+            cached = _TASK_SUMMARY_CACHE.get(cache_key)
+        if cached is not None and cached[0] == signature:
+            tasks.append(dict(cached[1]))
             continue
-        messages, _ = loaded
-        try:
-            created = datetime.fromtimestamp(checkpoint.stat().st_mtime).isoformat(timespec="seconds")
-        except OSError:
+        summary = _summarize_task(task_directory)
+        if summary is None:
             continue
-        tasks.append(
-            {
-                "id": task_directory.name,
-                "created": created,
-                "status": load_status(task_directory.name) or "unknown",
-                "message_count": len(messages),
-                "current_branch": get_current_branch(task_directory.name),
-                "branches": list(list_branches(task_directory.name).keys()) or [DEFAULT_BRANCH],
-            }
-        )
+        with _TASK_SUMMARY_CACHE_LOCK:
+            _TASK_SUMMARY_CACHE[cache_key] = (signature, dict(summary))
+        tasks.append(summary)
+
+    with _TASK_SUMMARY_CACHE_LOCK:
+        for stale in [key for key in _TASK_SUMMARY_CACHE if key not in seen]:
+            _TASK_SUMMARY_CACHE.pop(stale, None)
 
     return sorted(tasks, key=lambda task: task["id"], reverse=True)

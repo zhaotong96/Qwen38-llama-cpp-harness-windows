@@ -4,13 +4,19 @@ from __future__ import annotations
 from datetime import datetime
 import json
 from pathlib import Path
+import time
 from typing import Any
 
 from core import persistence
+from core.persistence import _read_text_tolerant as _read_tolerant
 from core.persistence import _task_directory, atomic_write_text
 
 ABORT_FLAG_FILE = "abort.flag"
 STEP_STATE_FILE = "step_state"
+STEP_MODE_FILE = "step_mode"
+STEP_CONTINUE_FILE = "step_continue.flag"
+STEP_MODES = ("auto", "step_risky", "step_all")
+DEFAULT_STEP_MODE = "auto"
 
 
 def _resolve_target_dir(task_id: str, base_root: Path | None = None) -> Path:
@@ -189,3 +195,68 @@ def consume_abort_flag(
             pass
         flag_path.unlink(missing_ok=True)
     return info
+
+
+def get_step_mode(task_id: str | None, base_root: Path | None = None) -> str:
+    """Read the single-line step gate mode from disk; defaults to ``auto``."""
+    if not task_id:
+        return DEFAULT_STEP_MODE
+    try:
+        mode_file = _resolve_target_dir(task_id, base_root=base_root) / STEP_MODE_FILE
+    except ValueError:
+        return DEFAULT_STEP_MODE
+    raw = (_read_tolerant(mode_file) or "").strip().lower()
+    return raw if raw in STEP_MODES else DEFAULT_STEP_MODE
+
+
+def set_step_mode(task_id: str, mode: str, base_root: Path | None = None) -> str:
+    """Persist the step gate mode as a single plain-text word."""
+    normalized = str(mode or "").strip().lower()
+    if normalized not in STEP_MODES:
+        raise ValueError(f"invalid step mode: {mode!r} (expected one of {', '.join(STEP_MODES)})")
+    task_dir = _resolve_target_dir(task_id, base_root=base_root)
+    task_dir.mkdir(parents=True, exist_ok=True)
+    atomic_write_text(task_dir / STEP_MODE_FILE, f"{normalized}\n")
+    return normalized
+
+
+def write_step_continue(task_id: str, base_root: Path | None = None) -> Path:
+    """Create the one-shot operator release flag for a paused pre-dispatch breakpoint."""
+    task_dir = _resolve_target_dir(task_id, base_root=base_root)
+    task_dir.mkdir(parents=True, exist_ok=True)
+    return atomic_write_text(task_dir / STEP_CONTINUE_FILE, "continue\n")
+
+
+def consume_step_continue(task_id: str | None, base_root: Path | None = None) -> bool:
+    """Return True exactly once when a step_continue.flag was present, deleting it."""
+    if not task_id:
+        return False
+    try:
+        flag_path = _resolve_target_dir(task_id, base_root=base_root) / STEP_CONTINUE_FILE
+    except ValueError:
+        return False
+    if not flag_path.is_file():
+        return False
+    try:
+        flag_path.unlink()
+    except OSError:
+        pass
+    return True
+
+
+def wait_for_step_continue(
+    task_id: str,
+    poll_interval: float = 0.1,
+    base_root: Path | None = None,
+) -> dict[str, Any] | None:
+    """Block until the operator releases the breakpoint or aborts the step.
+
+    Returns the abort info when an abort won the race, otherwise None.
+    """
+    while True:
+        if consume_step_continue(task_id, base_root=base_root):
+            return None
+        abort_info = is_step_rejected(task_id, base_root=base_root)
+        if abort_info is not None:
+            return abort_info
+        time.sleep(poll_interval)
