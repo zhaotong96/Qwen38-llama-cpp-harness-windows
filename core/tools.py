@@ -4,6 +4,7 @@ Tool implementations and skill registration for the local agent.
 from __future__ import annotations
 
 import base64
+from collections import deque
 from datetime import datetime
 import importlib.util
 import io
@@ -100,6 +101,25 @@ if sys.platform == "win32":
     _kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
     _kernel32.CloseHandle.restype = wintypes.BOOL
 
+PIPE_HEAD_BYTES = 256 * 1024
+PIPE_TAIL_BYTES = 256 * 1024
+PIPE_READ_CHUNK = 4096
+
+NON_INTERACTIVE_ENV = {
+    "GIT_TERMINAL_PROMPT": "0",
+    "GCM_INTERACTIVE": "never",
+    "GIT_ASKPASS": "echo",
+    "SSH_ASKPASS": "echo",
+    "CI": "true",
+    "TF_INPUT": "0",
+    "PIP_NO_INPUT": "1",
+    "NPM_CONFIG_YES": "true",
+    "PYTHONUNBUFFERED": "1",
+    "PYTHONIOENCODING": "utf-8",
+    "TERM": "dumb",
+    "NO_COLOR": "1",
+}
+
 _screenshot_counter = 0
 _active_context = threading.local()
 
@@ -190,11 +210,50 @@ def _close_handle(h_job: int | None) -> None:
         pass
 
 
-def _drain_stream(stream, sink: list[str]) -> None:
-    """Continuously drain one child pipe so the OS buffer can never block the child."""
+def _drain_stream(
+    stream,
+    sink: list[str],
+    head_limit: int = PIPE_HEAD_BYTES,
+    tail_limit: int = PIPE_TAIL_BYTES,
+) -> None:
+    """Drain one child pipe with a bounded head/tail ring buffer.
+
+    ``readline()`` lets CPython grow a single C-level buffer without bound when
+    the child emits a huge line without newlines. Chunked ``read()`` plus a
+    fixed head and a deque-backed tail caps peak retention per pipe at
+    ``head_limit + tail_limit`` characters.
+    """
+    head_parts: list[str] = []
+    head_chars = 0
+    tail_parts: deque[str] = deque()
+    tail_chars = 0
+    omitted_chars = 0
     try:
-        for chunk in iter(stream.readline, ""):
-            sink.append(chunk)
+        while True:
+            chunk = stream.read(PIPE_READ_CHUNK)
+            if not chunk:
+                break
+            if head_chars < head_limit:
+                take = min(head_limit - head_chars, len(chunk))
+                head_parts.append(chunk[:take])
+                head_chars += take
+                chunk = chunk[take:]
+            if not chunk:
+                continue
+            tail_parts.append(chunk)
+            tail_chars += len(chunk)
+            while tail_chars > tail_limit:
+                overflow = tail_chars - tail_limit
+                first = tail_parts[0]
+                if len(first) <= overflow:
+                    tail_parts.popleft()
+                    tail_chars -= len(first)
+                    omitted_chars += len(first)
+                else:
+                    tail_parts[0] = first[overflow:]
+                    tail_chars -= overflow
+                    omitted_chars += overflow
+                    break
     except Exception:
         pass
     finally:
@@ -202,6 +261,10 @@ def _drain_stream(stream, sink: list[str]) -> None:
             stream.close()
         except Exception:
             pass
+        sink.extend(head_parts)
+        if omitted_chars:
+            sink.append(f"\n...[output truncated: {omitted_chars} more chars omitted]...\n")
+        sink.extend(tail_parts)
 
 
 def _run_process(argv: list[str], timeout: float) -> tuple[str, str, str, int | None]:
@@ -211,12 +274,14 @@ def _run_process(argv: list[str], timeout: float) -> tuple[str, str, str, int | 
     "ok", "timeout", "interrupted", or "spawn_error".
     """
     popen_kwargs: dict = {
+        "stdin": subprocess.DEVNULL,
         "stdout": subprocess.PIPE,
         "stderr": subprocess.PIPE,
         "text": True,
         "encoding": "utf-8",
         "errors": "replace",
         "cwd": str(ROOT),
+        "env": {**os.environ, **NON_INTERACTIVE_ENV},
     }
     if sys.platform != "win32":
         popen_kwargs["start_new_session"] = True
@@ -446,7 +511,7 @@ def tool_shell(command: str, task_id: str | None = None) -> str:
 
     try:
         status, stdout, stderr, returncode = _run_process(
-            ["pwsh", "-NoProfile", "-Command", command],
+            ["pwsh", "-NoProfile", "-NonInteractive", "-Command", command],
             SHELL_TIMEOUT,
         )
     except Exception as e:

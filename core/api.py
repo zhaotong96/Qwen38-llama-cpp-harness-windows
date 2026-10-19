@@ -322,6 +322,8 @@ class Handler(BaseHTTPRequestHandler):
             return self._task_branches(parts[1])
         if len(parts) == 3 and parts[0] == "tasks" and parts[2] == "step_state":
             return self._task_step_state(parts[1])
+        if len(parts) == 3 and parts[0] == "tasks" and parts[2] == "step_mode":
+            return self._task_step_mode(parts[1])
         if parts == ["queue"]:
             return self._json(200, {"queue": queue_manager.list_queue()})
         if len(parts) == 2 and parts[0] == "queue":
@@ -483,6 +485,21 @@ class Handler(BaseHTTPRequestHandler):
                 "task_id": task_id,
                 "step_state": interrupt.read_step_state(task_id),
                 "abort_flag": interrupt.check_abort_flag(task_id),
+                "step_mode": interrupt.get_step_mode(task_id),
+            },
+        )
+
+    def _task_step_mode(self, task_id: str) -> None:
+        try:
+            persistence._validate_identifier(task_id, "task id")
+        except ValueError:
+            return self._json(404, {"error": f"unknown task: {task_id}"})
+        self._json(
+            200,
+            {
+                "task_id": task_id,
+                "step_mode": interrupt.get_step_mode(task_id),
+                "step_state": interrupt.read_step_state(task_id),
             },
         )
 
@@ -740,6 +757,36 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json(400, {"error": str(e)})
             self.harness.broadcast_event("tag_created", res, task_id=task_id)
             return self._json(201, res)
+
+        if len(parts) == 3 and parts[0] == "tasks" and parts[2] == "step_mode":
+            task_id = parts[1]
+            mode = body.get("mode") or body.get("step_mode")
+            if not isinstance(mode, str) or not mode.strip():
+                return self._json(400, {"error": "body must contain 'mode'"})
+            try:
+                resolved = interrupt.set_step_mode(task_id, mode.strip())
+            except ValueError as e:
+                return self._json(400, {"error": str(e)})
+            self.harness.broadcast_event(
+                "step_mode_changed",
+                {"task_id": task_id, "step_mode": resolved},
+                task_id=task_id,
+            )
+            return self._json(200, {"ok": True, "task_id": task_id, "step_mode": resolved})
+
+        if len(parts) == 3 and parts[0] == "tasks" and parts[2] == "step_continue":
+            task_id = parts[1]
+            try:
+                persistence._validate_identifier(task_id, "task id")
+                path = interrupt.write_step_continue(task_id)
+            except ValueError as e:
+                return self._json(400, {"error": str(e)})
+            self.harness.broadcast_event(
+                "step_continue_set",
+                {"task_id": task_id, "flag": path.name},
+                task_id=task_id,
+            )
+            return self._json(200, {"ok": True, "task_id": task_id, "flag": path.name})
 
         if parts == ["interrupt"] or (len(parts) == 3 and parts[0] == "tasks" and parts[2] == "interrupt"):
             target_id = (

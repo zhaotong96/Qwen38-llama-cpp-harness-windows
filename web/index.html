@@ -16,6 +16,17 @@
       <span class="badge phase-badge" id="phase-badge">phase: idle</span>
     </div>
     <div class="topbar-actions">
+      <label class="step-mode-label" title="高危写操作风险门禁">
+        <span>步进:</span>
+        <select id="step-mode-select">
+          <option value="auto">auto (全速)</option>
+          <option value="step_risky">step_risky (高危暂停)</option>
+          <option value="step_all">step_all (每步暂停)</option>
+        </select>
+      </label>
+      <button id="btn-step-continue" class="btn btn-secondary" title="写入 step_continue.flag 放行当前暂停点">
+        放行一步 (Continue)
+      </button>
       <select id="abort-mode-select" title="Interrupt Mode">
         <option value="reject_execution">Decode &amp; Reject Execution (Gate 2)</option>
         <option value="abort_stream">Abort Stream Immediately (Gate 1)</option>
@@ -26,6 +37,17 @@
       <button id="btn-refresh" class="btn btn-secondary">刷新磁盘投影</button>
     </div>
   </header>
+
+  <aside id="whitebox-inspector-drawer" class="inspector-drawer" aria-hidden="true">
+    <div class="inspector-header">
+      <h2>白盒检查 (Raw JSON)</h2>
+      <div class="inspector-actions">
+        <span class="mono-meta" id="inspector-node-id"></span>
+        <button type="button" id="btn-close-inspector" class="btn btn-small">关闭</button>
+      </div>
+    </div>
+    <pre class="inspector-json" id="inspector-json"></pre>
+  </aside>
 
   <main class="workspace-grid">
     <!-- Left Column: Sessions & Git-Style Context DAG Tree -->
@@ -109,8 +131,16 @@
       </form>
     </section>
 
-    <!-- Right Column: Unified Message Queue, Isolated SubAgents, & Multi-API Router -->
+    <!-- Right Column: Fact Ledger, Unified Message Queue, Isolated SubAgents, & Multi-API Router -->
     <section class="panel panel-right">
+      <div class="subpanel" id="fact-ledger-card">
+        <div class="panel-header">
+          <h2>事实账本常驻看板 (Fact Ledger)</h2>
+          <span class="badge" id="fact-ledger-badge">live</span>
+        </div>
+        <div class="fact-ledger-body" id="fact-ledger-body"></div>
+      </div>
+
       <div class="subpanel">
         <div class="panel-header">
           <h2>双端统一排队总线 (.agent/queue/)</h2>

@@ -4,10 +4,13 @@
  */
 import { renderDagTree, renderBranchBar, contentToText } from "./tree_view.js";
 import { renderQueuePanel } from "./queue_panel.js";
+import { renderFactLedger } from "./fact_ledger.js";
+import { bindInspector, openInspector } from "./inspector.js";
 
 const STREAM_CAP = 200000;
 const DELTA_EVENTS = ["reasoning_delta", "content_delta", "tool_call_delta", "tool_start", "tool_rejected", "tool_interrupted"];
-const SYNC_EVENTS = ["step_phase", "queue_updated", "queue_consumed", "branch_created", "branch_checked_out", "interrupt_set", "providers_updated", "session_changed", "tag_created"];
+const SYNC_EVENTS = ["step_phase", "queue_updated", "queue_consumed", "branch_created", "branch_checked_out", "interrupt_set", "providers_updated", "session_changed", "tag_created", "step_mode_changed", "step_continue_set"];
+const REFRESH_DEBOUNCE_MS = 120;
 
 const state = {
   currentSession: null,
@@ -22,6 +25,10 @@ const state = {
   refreshTicket: 0,
   providersText: "",
   noticeToken: 0,
+  stepMode: "auto",
+  streamPending: "",
+  streamFrame: 0,
+  refreshTimer: 0,
 };
 
 async function apiCall(method, path, body = null) {
@@ -260,9 +267,14 @@ async function refreshAll() {
         onSelectNode: (node) => {
           const forkInput = el("fork-node-id");
           if (forkInput) forkInput.value = node.id;
+          openInspector(node);
         },
       });
       renderActiveMessages(tree);
+      renderFactLedger(el("fact-ledger-body"), el("fact-ledger-badge"), tree);
+      state.stepMode = tree.step_mode || "auto";
+      const stepSelect = el("step-mode-select");
+      if (stepSelect && stepSelect.value !== state.stepMode) stepSelect.value = state.stepMode;
     } else {
       state.tree = null;
       el("phase-badge").textContent = `phase: ${state.busy ? "running" : "idle"}`;
@@ -383,8 +395,6 @@ function handleDelta(evt) {
     stepLabel.textContent = `实时解码流 (${type})`;
   }
 
-  const box = el("live-stream-output");
-  if (!box) return;
   let appended = "";
   if ((type === "content_delta" || type === "reasoning_delta") && typeof payload.delta === "string") {
     appended = payload.delta;
@@ -400,14 +410,35 @@ function handleDelta(evt) {
   }
   if (!appended) return;
 
+  state.streamPending += appended;
+  if (!state.streamFrame) {
+    state.streamFrame = window.requestAnimationFrame(flushStream);
+  }
+}
+
+function flushStream() {
+  state.streamFrame = 0;
+  const box = el("live-stream-output");
+  const pending = state.streamPending;
+  state.streamPending = "";
+  if (!box || !pending) return;
+
   const nearBottom = box.scrollHeight - box.scrollTop - box.clientHeight < 48;
-  box.textContent += appended;
+  box.textContent += pending;
   if (box.textContent.length > STREAM_CAP) {
     box.textContent = "⟨较早输出已截断⟩\n" + box.textContent.slice(-(STREAM_CAP - 40000));
   }
   state.streamChars = box.textContent.length;
   updateCharLabel();
   if (nearBottom) box.scrollTop = box.scrollHeight;
+}
+
+function scheduleRefresh() {
+  if (state.refreshTimer) return;
+  state.refreshTimer = window.setTimeout(() => {
+    state.refreshTimer = 0;
+    refreshAll();
+  }, REFRESH_DEBOUNCE_MS);
 }
 
 function connectSse() {
@@ -436,7 +467,7 @@ function connectSse() {
   for (const syncType of SYNC_EVENTS) {
     es.addEventListener(syncType, (evt) => {
       handleDelta(evt);
-      refreshAll();
+      scheduleRefresh();
     });
   }
 }
@@ -445,6 +476,38 @@ function bindEvents() {
   el("btn-refresh")?.addEventListener("click", () => {
     setNotice("正在重新拉取磁盘投影…");
     refreshAll();
+  });
+
+  el("step-mode-select")?.addEventListener("change", async (event) => {
+    const mode = event.target.value;
+    if (!state.currentSession) {
+      setNotice("没有活动会话，无法设置步进模式", "error");
+      event.target.value = state.stepMode;
+      return;
+    }
+    const { status, data } = await apiCall("POST", `/tasks/${state.currentSession}/step_mode`, { mode });
+    if (status !== 200) {
+      setNotice(`步进模式设置失败: ${errorText(data, status)}`, "error");
+      event.target.value = state.stepMode;
+    } else {
+      state.stepMode = data.step_mode;
+      setNotice(`步进模式已设为 ${data.step_mode}`, "ok");
+    }
+    await refreshAll();
+  });
+
+  el("btn-step-continue")?.addEventListener("click", async () => {
+    if (!state.currentSession) {
+      setNotice("没有活动会话，无法放行", "error");
+      return;
+    }
+    const { status, data } = await apiCall("POST", `/tasks/${state.currentSession}/step_continue`, {});
+    if (status !== 200) {
+      setNotice(`放行失败: ${errorText(data, status)}`, "error");
+    } else {
+      setNotice("已写入 step_continue.flag，等待引擎消费", "ok");
+    }
+    await refreshAll();
   });
 
   el("task-select")?.addEventListener("change", async (e) => {
@@ -645,6 +708,7 @@ function bindEvents() {
 
 window.addEventListener("DOMContentLoaded", async () => {
   bindEvents();
+  bindInspector();
   await refreshAll();
   connectSse();
 });

@@ -9,6 +9,7 @@ from core import agent as agent_mod
 from core import interrupt
 from core import persistence
 from core import subagent_runner
+from core import tools as tools_mod
 from skills import subagent as subagent_skill
 from tests.support import IsolatedCase, ScriptedLLM, build_agent
 
@@ -86,6 +87,108 @@ class SubAgentIsolationTests(IsolatedCase):
         sub_status = (subagent_runner.subagents_root() / sub_id / "status").read_text(encoding="utf-8").strip()
         self.assertEqual(sub_status, "cancelled")
         self.assertFalse(subagent_runner.active_lock_path().exists())
+
+
+class SubAgentCrossSandboxTests(IsolatedCase):
+    def test_runtime_exposes_parent_task_id_without_overwrite(self):
+        self.write_skill(
+            "runtime_probe",
+            "import json\n"
+            "DESCRIPTION = 'probe'\n"
+            "PARAMETERS = {'type': 'object', 'properties': {}}\n"
+            "def run(args, runtime):\n"
+            "    return json.dumps({k: str(runtime.get(k)) for k in ('task_id', 'parent_task_id')})\n",
+        )
+        with self.patch_skill_roots():
+            agent, _ = build_agent(parent_task_id="main_task_42")
+        agent.current_task_id = "sub_task_7"
+        payload = json.loads(agent.dispatchers["runtime_probe"]({}))
+        self.assertEqual(payload["task_id"], "sub_task_7")
+        self.assertEqual(payload["parent_task_id"], "main_task_42")
+
+    def test_read_checkpoint_node_reaches_main_root_from_subagent_sandbox(self):
+        parent_id = "main_root_task"
+        persistence.save_checkpoint(
+            parent_id,
+            [
+                {"role": "system", "content": "sys"},
+                {"role": "user", "content": "remember BENCH_SECRET_PORT=49152"},
+            ],
+        )
+        parent_nodes, _ = persistence.load_dag_nodes(parent_id)
+        target_id = parent_nodes[-1]["id"]
+
+        sub_root = self.state / "subagents"
+        sub_task = "sub_20261019_000001"
+        sub_dir = sub_root / sub_task
+        sub_dir.mkdir(parents=True, exist_ok=True)
+        (sub_dir / "checkpoint.jsonl").write_text(
+            json.dumps({"role": "user", "content": "sub only"}) + "\n",
+            encoding="utf-8",
+        )
+
+        skill = next(
+            s for s in tools_mod.discover_skills() if s["name"] == "read_checkpoint_node"
+        )
+        out = skill["module"].run(
+            {"node_id": target_id},
+            {
+                "task_id": sub_task,
+                "parent_task_id": parent_id,
+                "tasks_root": sub_root,
+                "parent_tasks_root": self.tasks_root,
+            },
+        )
+        self.assertIn("BENCH_SECRET_PORT", out)
+        self.assertNotIn("parent_id", out)
+
+
+class SubAgentSlotRoutingTests(IsolatedCase):
+    class _FakeAgent:
+        captured_config = None
+
+        def __init__(self, config, **kwargs):
+            type(self).captured_config = config
+            self.tools = []
+            self.dispatchers = {}
+            self.client = None
+            self.last_aborted = False
+
+        def run_task(self, prompt, task_id=None):
+            return "TASK_DONE: routed"
+
+    def test_busy_preferred_slot_routes_subagent_to_idle_slot(self):
+        with mock.patch.object(
+            subagent_runner.config_mod, "select_available_slot", return_value=2
+        ) as probe, mock.patch.object(agent_mod, "Agent", self._FakeAgent):
+            raw = subagent_skill.run({"objective": "route around busy slot"})
+
+        self.assertEqual(json.loads(raw)["status"], "completed")
+        probe.assert_called_once()
+        self.assertEqual(probe.call_args.kwargs["preferred"], 1)
+        self.assertEqual(self._FakeAgent.captured_config.chat_extra["id_slot"], 2)
+
+    def test_all_non_main_slots_busy_blocks_delegation_without_lock(self):
+        with mock.patch.object(
+            subagent_runner.config_mod, "select_available_slot", return_value=None
+        ), mock.patch.object(agent_mod, "Agent", self._FakeAgent):
+            raw = subagent_skill.run({"objective": "should be refused"})
+
+        self.assertTrue(raw.startswith("error: SUBAGENT_SLOTS_BUSY:"))
+        self.assertFalse(subagent_runner.active_lock_path().exists())
+
+    def test_injected_client_skips_slot_probe(self):
+        sub_llm = ScriptedLLM([{"content": "TASK_DONE: injected"}])
+        with mock.patch.object(
+            subagent_runner.config_mod, "select_available_slot"
+        ) as probe, mock.patch.object(agent_mod, "OpenAI", lambda *a, **k: sub_llm):
+            raw = subagent_skill.run(
+                {"objective": "injected client"},
+                runtime={"subagent_client": sub_llm},
+            )
+
+        self.assertEqual(json.loads(raw)["status"], "completed")
+        probe.assert_not_called()
 
 
 if __name__ == "__main__":

@@ -15,6 +15,7 @@ import time
 import unittest
 from ctypes import wintypes
 from pathlib import Path
+from unittest import mock
 
 from core import interrupt
 from core import tools as tools_mod
@@ -54,6 +55,127 @@ class PipeDrainTests(unittest.TestCase):
         _drain_result(out)
         self.assertIn("exit=0", out)
         self.assertIn("more chars", out)
+
+
+class _ChunkedStream:
+    def __init__(self, chunks: list[str]) -> None:
+        self._chunks = list(chunks)
+        self.closed = False
+
+    def read(self, size: int) -> str:
+        if not self._chunks:
+            return ""
+        return self._chunks.pop(0)
+
+    def close(self) -> None:
+        self.closed = True
+
+
+class RingBufferDrainTests(unittest.TestCase):
+    def test_million_char_single_line_is_bounded_and_marked(self):
+        stream = _ChunkedStream(["A" * 1000] * 1000)
+        sink: list[str] = []
+        tools_mod._drain_stream(stream, sink)
+        text = "".join(sink)
+
+        self.assertTrue(stream.closed)
+        self.assertIn("more chars", text)
+        self.assertIn("output truncated", text)
+        self.assertLessEqual(
+            len(text),
+            tools_mod.PIPE_HEAD_BYTES + tools_mod.PIPE_TAIL_BYTES + 120,
+        )
+
+    def test_short_output_is_returned_verbatim(self):
+        sink: list[str] = []
+        tools_mod._drain_stream(_ChunkedStream(["hello ", "world"]), sink)
+        self.assertEqual("".join(sink), "hello world")
+
+    def test_head_and_tail_are_preserved(self):
+        body = "H" * 5000 + "M" * 20000 + "T" * 5000
+        sink: list[str] = []
+        tools_mod._drain_stream(
+            _ChunkedStream([body[i:i + 4096] for i in range(0, len(body), 4096)]),
+            sink,
+            head_limit=4096,
+            tail_limit=4096,
+        )
+        text = "".join(sink)
+        self.assertTrue(text.startswith("H" * 4096))
+        self.assertTrue(text.endswith("T" * 4096))
+        self.assertIn("21808 more chars omitted", text)
+
+
+class NonInteractiveTests(unittest.TestCase):
+    def test_run_process_injects_stdin_devnull_and_env(self):
+        captured = {}
+
+        class _FakeProc:
+            pid = 1234
+            returncode = 0
+            stdout = None
+            stderr = None
+
+            def poll(self):
+                return 0
+
+            def wait(self, timeout=None):
+                return 0
+
+        def fake_popen(argv, **kwargs):
+            captured["argv"] = argv
+            captured["kwargs"] = kwargs
+            return _FakeProc()
+
+        with mock.patch.object(tools_mod.subprocess, "Popen", fake_popen):
+            with mock.patch.object(tools_mod, "_create_kill_on_close_job", lambda: None):
+                tools_mod._run_process(["pwsh", "-NoProfile", "-Command", "echo hi"], 1)
+
+        self.assertEqual(captured["kwargs"]["stdin"], tools_mod.subprocess.DEVNULL)
+        env = captured["kwargs"]["env"]
+        for key, value in tools_mod.NON_INTERACTIVE_ENV.items():
+            self.assertEqual(env[key], value)
+        self.assertEqual(tools_mod.NON_INTERACTIVE_ENV["GIT_TERMINAL_PROMPT"], "0")
+
+    def test_shell_launches_pwsh_non_interactive(self):
+        captured = {}
+
+        def fake_run_process(argv, timeout):
+            captured["argv"] = argv
+            return "ok", "done", "", 0
+
+        with mock.patch.object(tools_mod, "_run_process", fake_run_process):
+            out = tools_mod.tool_shell("Write-Output hi")
+
+        self.assertIn("-NonInteractive", captured["argv"])
+        self.assertIn("exit=0", out)
+
+    def test_read_host_returns_immediately(self):
+        started = time.monotonic()
+        out = tools_mod.tool_shell("Read-Host 'name'")
+        elapsed = time.monotonic() - started
+        _drain_result(out)
+        self.assertLess(elapsed, 10.0)
+        self.assertNotIn("exit=0", out)
+
+
+class GitSandboxTests(unittest.TestCase):
+    def test_git_status_runs_through_sandbox(self):
+        module = tools_mod._load_skill_module(tools_mod.ROOT / "skills" / "git.py")
+        fake = mock.Mock(return_value=("ok", "clean", "", 0))
+        with mock.patch.object(module, "_run_process", fake):
+            out = module.HANDLER(action="status")
+        self.assertTrue(fake.called)
+        self.assertIn("exit=0", out)
+        self.assertIn("clean", out)
+
+    def test_git_interrupt_marker_is_reported(self):
+        module = tools_mod._load_skill_module(tools_mod.ROOT / "skills" / "git.py")
+        with mock.patch.object(
+            module, "_run_process", lambda argv, timeout: ("interrupted", "", "", None)
+        ):
+            out = module.HANDLER(action="status")
+        self.assertIn("EXECUTION_INTERRUPTED_AND_IGNORED", out)
 
 
 def _pid_alive(pid: int) -> bool:

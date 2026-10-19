@@ -4,6 +4,7 @@ from __future__ import annotations
 import unittest
 
 from core import persistence
+from core.context import ContextManager
 from core import tools as tools_mod
 from tests.support import IsolatedCase
 
@@ -132,6 +133,32 @@ class CompactionBoundaryTests(IsolatedCase):
         out = skill["module"].run({"node_id": "n_404"}, {"parent_task_id": "compact_missing"})
         self.assertTrue(out.startswith("error:"))
         self.assertIn("not found", out)
+
+    def test_index_table_is_bounded_and_collapses_prior_epochs(self):
+        task_id = "compact_epochs"
+        ctx = ContextManager("sys")
+        ctx.bind_task(task_id)
+        for i in range(80):
+            ctx.append({"role": "user", "content": f"turn {i} " + ("x" * 80)})
+            ctx.append({"role": "assistant", "content": f"reply {i}"})
+
+        results = []
+        for _ in range(3):
+            result = persistence.compact_branch_dag(task_id, "摘要文本", keep_recent=2)
+            self.assertIsNotNone(result)
+            results.append(result)
+            branch_msgs = persistence.build_branch_context(task_id)
+            summary = branch_msgs[1]["content"]
+            index_block = summary.split("6. 已归档原始 DAG 节点索引表", 1)[1]
+            self.assertLessEqual(len(index_block.strip().splitlines()), 30)
+            ctx.reload_from_branch("main")
+            for i in range(80):
+                ctx.append({"role": "user", "content": f"more {i} " + ("y" * 80)})
+                ctx.append({"role": "assistant", "content": f"reply more {i}"})
+
+        final_summary = persistence.build_branch_context(task_id)[1]["content"]
+        self.assertIn("compaction-epoch", final_summary)
+        self.assertIn(results[-2]["compaction_node_id"], final_summary)
 
 
 if __name__ == "__main__":

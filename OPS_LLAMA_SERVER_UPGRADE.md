@@ -11,16 +11,16 @@
 
 ## 一、升级背景与技术参数对比
 
-经领域专家深度审计与底层内核分析，现行的 `llama-server.service` 在以下 6 项配置上存在性能瓶颈与状态清空隐患，需进行针对性升级：
+经结合底层内核分析与实际硬件实测决断，现行的 `llama-server.service` 参数升级策略明确如下：
 
-| 参数项 | 变更前 | **生产升级设定值** | 解决的核心物理痛点与机制依据 |
+| 参数项 | 变更前 | **生产升级设定值** | 架构决断与底层物理依据 |
 | :--- | :--- | :--- | :--- |
-| **`--spec-draft-n-max`** | `4` | **`2`** | 消除 IQ4_XS 量化下单层辅助草稿头在生成 JSON 紧凑语法（转义符、括号嵌套）时的跳字崩塌，大幅提高工具调用参数合法率与投机接受率。 |
+| **`--spec-draft-n-max`** | `4` | **`4` *(维持原值)*** | **绝对维持 4**。Tesla M40 显存带宽受限（288 GB/s），计算与访存延迟显著；实测草稿长度为 4 时有效接受命中率最高，能最大化摊薄权重搬运开销。 |
+| **`--cache-reuse`** | *(默认 0 禁用)* | **`0` *(严禁开启)*** | **绝对禁止开启**。当前服务已挂载 `--mmproj` 多模态视觉模块。`llama.cpp` 中视觉 Patch 嵌入与 Token 级前缀缓存复用机制存在结构性冲突，开启极易引发视觉向量错位与内核断言崩溃，专家此处为严重误判，必须坚决禁用。 |
 | **`--no-cache-idle-slots`** | *(默认未配置，即 true)* | **显式声明启用** | 阻断当 Slot 1 启动短周期子任务或压缩器时，触发 `[TAG_IDLE_SLOT_CLEAR]` 逻辑将处于暂态闲置的 Slot 0 主分支 KV 缓存清空。 |
 | **`--checkpoint-min-step` (`-cms`)** | `8192` *(编译期默认)* | **`1024`** | 将 Qwen3.8 混合架构（48 层 DeltaNet 循环状态）检查点的最小留存间距从 8,192 降至 1,024 Token，确保每 1~2 轮 ReAct 交互均有可回滚快照。 |
 | **`--ctx-checkpoints` (`-ctxcp`)** | `32` *(编译期默认)* | **`64`** | 将每个槽位可保存的状态快照数翻倍，支持多达 64 层的深分支回滚。 |
 | **`--cache-ram` (`-cram`)** | `8192` *(8 GiB)* | **`16384` *(16 GiB)*** | 分配 16 GiB 宿主机系统内存池用于容纳 64 个混合检查点，完全不消耗 Tesla M40 宝贵的 24GB 显存。 |
-| **`--cache-reuse`** | *(默认 0 禁用)* | **`256`** | 开启最小 256 Token 块的 KV 移位复用能力，缓解截图淘汰与局部修剪后的全量重算。 |
 
 ---
 
@@ -43,7 +43,7 @@ ExecStart=/home/zt/llama.cpp-0.6.0/build/bin/llama-server \
   --model Qwen3.8-27B-Uncensored-IQ4_XS.gguf \
   --mmproj mmproj-Qwen3.8-27B-Uncensored-F16.gguf \
   --spec-type draft-mtp \
-  --spec-draft-n-max 2 \
+  --spec-draft-n-max 4 \
   --spec-draft-n-min 1 \
   -ngl 99 \
   -c 128000 \
@@ -55,7 +55,6 @@ ExecStart=/home/zt/llama.cpp-0.6.0/build/bin/llama-server \
   --cache-ram 16384 \
   --ctx-checkpoints 64 \
   --checkpoint-min-step 1024 \
-  --cache-reuse 256 \
   --jinja \
   --chat-template-file chat_template.jinja \
   --metrics \

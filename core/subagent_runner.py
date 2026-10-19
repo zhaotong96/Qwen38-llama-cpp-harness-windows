@@ -183,6 +183,34 @@ def run_subagent(args: dict[str, Any], runtime: dict[str, Any] | None = None) ->
     root.mkdir(parents=True, exist_ok=True)
     lock_file = active_lock_path()
 
+    active_id = get_active_subagent()
+    if active_id is not None:
+        return (
+            f"error: SUBAGENT_BUSY: SubAgent '{active_id}' is currently active. "
+            "Maintain single-SubAgent execution; wait until it reaches completed, failed, or cancelled."
+        )
+
+    try:
+        sub_config = config_mod.load_config(role="subagent")
+        sub_config.max_rounds = max_rounds
+        preferred_slot = sub_config.chat_extra.get("id_slot")
+        injected_client = bool(runtime and runtime.get("subagent_client") is not None)
+        available_slot = (
+            config_mod.select_available_slot(sub_config.base_url, preferred=int(preferred_slot))
+            if preferred_slot is not None and not injected_client
+            else None
+        )
+    except Exception as exc:
+        return f"error: SUBAGENT_CONFIG: unable to resolve the subagent endpoint: {exc}"
+
+    if available_slot is None and preferred_slot is not None and not injected_client:
+        return (
+            "error: SUBAGENT_SLOTS_BUSY: every non-main inference slot is occupied by an "
+            "external task. Continue without delegation or retry after the remote job finishes."
+        )
+    if available_slot is not None and available_slot != preferred_slot:
+        sub_config.chat_extra["id_slot"] = available_slot
+
     with _subagent_mutex:
         active_id = get_active_subagent()
         if active_id is not None:
@@ -200,9 +228,6 @@ def run_subagent(args: dict[str, Any], runtime: dict[str, Any] | None = None) ->
     main_tasks_root = persistence.TASKS_ROOT
 
     try:
-        sub_config = config_mod.load_config(role="subagent")
-        sub_config.max_rounds = max_rounds
-
         sub_agent = Agent(
             config=sub_config,
             goal_mode=False,
