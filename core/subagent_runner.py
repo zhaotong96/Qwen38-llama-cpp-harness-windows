@@ -14,7 +14,9 @@ from core import persistence
 
 
 ACTIVE_LOCK_FILE = "active.lock"
-EXCLUDED_META_SKILLS = frozenset({"subagent", "add_skill", "modify_skill"})
+EXCLUDED_META_SKILLS = frozenset(
+    {"subagent", "add_skill", "modify_skill", "branch_rewind"}
+)
 MAX_REPORT_CHARS = 2000
 _subagent_mutex = threading.Lock()
 

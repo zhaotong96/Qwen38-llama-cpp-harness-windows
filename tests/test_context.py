@@ -3,7 +3,9 @@ from __future__ import annotations
 
 import unittest
 
+from core import persistence
 from core.context import ContextManager
+from tests.support import IsolatedCase
 
 
 def image_message(path: str) -> dict:
@@ -127,6 +129,40 @@ class CompactionTests(unittest.TestCase):
         ctx.clear_task()
         self.assertEqual(len(ctx.messages), 1)
         self.assertEqual(ctx.messages[0]["role"], "system")
+
+
+class BranchSnapshotConsistencyTests(IsolatedCase):
+    def test_append_keeps_receipt_on_the_turn_that_issued_the_tool(self):
+        task_id = "context_branch_race"
+        ctx = ContextManager("system")
+        ctx.bind_task(task_id)
+        ctx.append({"role": "user", "content": "start"})
+        assistant = ctx.append({"role": "assistant", "content": "calling tool"})
+
+        persistence.create_branch(
+            task_id,
+            "external_checkout",
+            from_node_id=assistant["id"],
+            checkout=True,
+        )
+        self.assertEqual(persistence.get_current_branch(task_id), "external_checkout")
+        self.assertEqual(ctx.branch, "main")
+
+        ctx.append(
+            {"role": "tool", "tool_call_id": "call_1", "content": "tool receipt"}
+        )
+
+        self.assertEqual(ctx.branch, "main")
+        main_contents = [
+            str(node.get("content", ""))
+            for node in persistence.build_branch_nodes(task_id, "main")
+        ]
+        alternate_contents = [
+            str(node.get("content", ""))
+            for node in persistence.build_branch_nodes(task_id, "external_checkout")
+        ]
+        self.assertIn("tool receipt", main_contents)
+        self.assertNotIn("tool receipt", alternate_contents)
 
 
 if __name__ == "__main__":
