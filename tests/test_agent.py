@@ -204,6 +204,24 @@ class RedlineFidelityTests(IsolatedCase):
         self.assertIn("NEVER touch the production slot", final)
         self.assertEqual(llm.requests[-1]["messages"][0]["role"], "user")
 
+    def test_branch_rewind_lesson_survives_cascaded_compactions(self):
+        lesson = (
+            "[Branch Rewind Lesson] (rewound 'main'@n_1 -> 'alt'@n_2): "
+            "Avoid failed approach: stale parser cache."
+        )
+        agent, _ = build_agent(
+            [{"content": self._ledger_without_redlines()} for _ in range(3)]
+        )
+        history = [{"role": "user", "content": lesson}]
+        for round_i in range(1, 4):
+            summary = agent._summarize(history)
+            self.assertIn(lesson, summary, f"rewind lesson lost at round {round_i}")
+            self.assertIn("4. 被否决方案与操作员红线（永久保留）", summary)
+            history = [
+                {"role": "system", "content": f"[Context Summary]\n{summary}"},
+                {"role": "user", "content": f"round {round_i} work"},
+            ]
+
     def test_redline_block_is_injected_into_instruction(self):
         agent, llm = build_agent([{"content": self._ledger_without_redlines()}])
         agent._summarize([{"role": "user", "content": self.REDLINE}])

@@ -45,6 +45,69 @@ if sys.platform == "win32":
     from ctypes import wintypes
 
     _kernel32 = ctypes.windll.kernel32
+    _user32 = ctypes.windll.user32
+    _shcore = getattr(ctypes.windll, "shcore", None)
+    _dwmapi = getattr(ctypes.windll, "dwmapi", None)
+
+    DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2 = ctypes.c_void_p(-4)
+    DWMWA_EXTENDED_FRAME_BOUNDS = 9
+    DESKTOP_SWITCHDESKTOP = 0x0100
+    UOI_NAME = 2
+    SM_XVIRTUALSCREEN = 76
+    SM_YVIRTUALSCREEN = 77
+    SM_CXVIRTUALSCREEN = 78
+    SM_CYVIRTUALSCREEN = 79
+
+    try:
+        _user32.SetProcessDpiAwarenessContext.argtypes = [ctypes.c_void_p]
+        _user32.SetProcessDpiAwarenessContext.restype = wintypes.BOOL
+        _user32.SetThreadDpiAwarenessContext.argtypes = [ctypes.c_void_p]
+        _user32.SetThreadDpiAwarenessContext.restype = ctypes.c_void_p
+        _user32.GetDpiForWindow.argtypes = [wintypes.HWND]
+        _user32.GetDpiForWindow.restype = wintypes.UINT
+    except AttributeError:
+        pass
+
+    _user32.GetForegroundWindow.argtypes = []
+    _user32.GetForegroundWindow.restype = wintypes.HWND
+    _user32.GetWindowTextLengthW.argtypes = [wintypes.HWND]
+    _user32.GetWindowTextLengthW.restype = ctypes.c_int
+    _user32.GetWindowTextW.argtypes = [wintypes.HWND, wintypes.LPWSTR, ctypes.c_int]
+    _user32.GetWindowTextW.restype = ctypes.c_int
+    _user32.GetWindowRect.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.RECT)]
+    _user32.GetWindowRect.restype = wintypes.BOOL
+    _user32.OpenInputDesktop.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+    _user32.OpenInputDesktop.restype = wintypes.HANDLE
+    _user32.CloseDesktop.argtypes = [wintypes.HANDLE]
+    _user32.CloseDesktop.restype = wintypes.BOOL
+    _user32.GetUserObjectInformationW.argtypes = [
+        wintypes.HANDLE,
+        ctypes.c_int,
+        wintypes.LPVOID,
+        wintypes.DWORD,
+        ctypes.POINTER(wintypes.DWORD),
+    ]
+    _user32.GetUserObjectInformationW.restype = wintypes.BOOL
+    if _dwmapi is not None:
+        _dwmapi.DwmGetWindowAttribute.argtypes = [
+            wintypes.HWND,
+            wintypes.DWORD,
+            wintypes.LPVOID,
+            wintypes.DWORD,
+        ]
+        _dwmapi.DwmGetWindowAttribute.restype = ctypes.c_long
+    _user32.SendMessageTimeoutW.argtypes = [
+        wintypes.HWND,
+        wintypes.UINT,
+        ctypes.c_size_t,
+        ctypes.c_size_t,
+        wintypes.UINT,
+        wintypes.UINT,
+        ctypes.POINTER(ctypes.c_size_t),
+    ]
+    _user32.SendMessageTimeoutW.restype = ctypes.c_size_t
+    _kernel32.ProcessIdToSessionId.argtypes = [wintypes.DWORD, ctypes.POINTER(wintypes.DWORD)]
+    _kernel32.ProcessIdToSessionId.restype = wintypes.BOOL
 
     JOB_OBJECT_LIMIT_ACTIVE_PROCESS = 0x00000008
     JOB_OBJECT_LIMIT_JOB_MEMORY = 0x00000200
@@ -208,6 +271,77 @@ def _close_handle(h_job: int | None) -> None:
         _kernel32.CloseHandle(h_job)
     except Exception:
         pass
+
+
+def enable_per_monitor_dpi_awareness() -> str:
+    """Lock this process into Per-Monitor V2 physical pixel space at startup."""
+    if sys.platform != "win32":
+        return "non_win32"
+    try:
+        if _user32.SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2):
+            return "per_monitor_v2"
+    except Exception:
+        pass
+    try:
+        if _shcore is not None and _shcore.SetProcessDpiAwareness(2) == 0:
+            return "per_monitor_v1"
+    except Exception:
+        pass
+    try:
+        if _user32.SetProcessDPIAware():
+            return "system_dpi"
+    except Exception:
+        pass
+    return "unaware"
+
+
+_DPI_MODE = enable_per_monitor_dpi_awareness()
+
+
+def probe_desktop_session_state() -> tuple[bool, str]:
+    """Detect Session 0 isolation or a locked/disconnected input desktop."""
+    if sys.platform != "win32":
+        return True, "ok"
+    session_id = wintypes.DWORD(0)
+    try:
+        if _kernel32.ProcessIdToSessionId(os.getpid(), ctypes.byref(session_id)):
+            if session_id.value == 0:
+                return False, "SESSION_0_ISOLATED: process is running in non-interactive Session 0"
+    except Exception:
+        pass
+
+    try:
+        h_desk = _user32.OpenInputDesktop(0, False, DESKTOP_SWITCHDESKTOP)
+    except Exception:
+        h_desk = None
+    if not h_desk:
+        return False, "DESKTOP_LOCKED: interactive input desktop is locked (Win+L) or UAC prompt active"
+    try:
+        buf = ctypes.create_unicode_buffer(128)
+        needed = wintypes.DWORD(0)
+        if _user32.GetUserObjectInformationW(
+            h_desk, UOI_NAME, buf, ctypes.sizeof(buf), ctypes.byref(needed)
+        ):
+            desk_name = (buf.value or "").strip().lower()
+            if desk_name in ("winlogon", "screen-saver", "disconnect"):
+                return False, f"DESKTOP_INACTIVE: current input desktop is '{desk_name}'"
+        return True, "ok"
+    finally:
+        try:
+            _user32.CloseDesktop(h_desk)
+        except Exception:
+            pass
+
+
+def get_window_dpi_scale(hwnd: int) -> float:
+    """Return the exact DPI scale factor (e.g. 1.5 for 150%) for a target HWND."""
+    if sys.platform != "win32" or not hwnd:
+        return 1.0
+    try:
+        dpi = int(_user32.GetDpiForWindow(hwnd))
+        return round(dpi / 96.0, 4) if dpi > 0 else 1.0
+    except Exception:
+        return 1.0
 
 
 def _drain_stream(
@@ -404,31 +538,47 @@ def trunc(s: str, n: int = 12000) -> str:
 
 
 def foreground_window() -> tuple[dict, str] | None:
-    """Windows: focused window region for mss + title. None if unusable."""
+    """Return DWM physical bounds (shadow-free), HWND, title, and DPI scale."""
     if sys.platform != "win32":
         return None
     try:
-        import ctypes
-        from ctypes import wintypes
-
-        user32 = ctypes.windll.user32
-        hwnd = user32.GetForegroundWindow()
+        hwnd = _user32.GetForegroundWindow()
         if not hwnd:
             return None
 
-        n = user32.GetWindowTextLengthW(hwnd)
+        n = _user32.GetWindowTextLengthW(hwnd)
         buf = ctypes.create_unicode_buffer(n + 1)
-        user32.GetWindowTextW(hwnd, buf, n + 1)
+        _user32.GetWindowTextW(hwnd, buf, n + 1)
         title = (buf.value or "").strip() or "(no title)"
 
         rect = wintypes.RECT()
-        if not user32.GetWindowRect(hwnd, ctypes.byref(rect)):
+        got_dwm = False
+        if _dwmapi is not None:
+            try:
+                hr = _dwmapi.DwmGetWindowAttribute(
+                    wintypes.HWND(hwnd),
+                    wintypes.DWORD(DWMWA_EXTENDED_FRAME_BOUNDS),
+                    ctypes.byref(rect),
+                    ctypes.sizeof(rect),
+                )
+                got_dwm = hr == 0
+            except Exception:
+                got_dwm = False
+        if not got_dwm and not _user32.GetWindowRect(hwnd, ctypes.byref(rect)):
             return None
+
         left, top, right, bottom = rect.left, rect.top, rect.right, rect.bottom
         width, height = right - left, bottom - top
         if width < 32 or height < 32:
             return None
-        region = {"left": left, "top": top, "width": width, "height": height}
+        region = {
+            "left": left,
+            "top": top,
+            "width": width,
+            "height": height,
+            "hwnd": int(hwnd),
+            "dpi_scale": get_window_dpi_scale(hwnd),
+        }
         return region, title
     except Exception:
         return None
@@ -621,27 +771,17 @@ def tool_screenshot() -> tuple[str, str | None]:
             if not path.exists():
                 return path
 
-    def _encode(raw, mode: str, title: str = "") -> tuple[str, str]:
-        img = Image.frombytes("RGB", raw.size, raw.bgra, "raw", "BGRX")
-        path = _get_next_path()
-        img.save(path, format="JPEG", quality=60)
-        buf = io.BytesIO()
-        img.save(buf, format="JPEG", quality=60)
-        b64 = base64.b64encode(buf.getvalue()).decode()
-        extra = f' title="{title}"' if title else ""
-        return (
-            f"screenshot saved: {path} "
-            f"({img.size[0]}x{img.size[1]}) mode={mode}{extra}",
-            b64,
-        ), b64  # wait: keep exact tuple (str, b64) below!
-
     try:
         with mss.MSS() as sct:
             fg = foreground_window()
             if fg:
                 region, title = fg
                 try:
-                    raw = sct.grab(region)
+                    grab_region = {
+                        key: region[key]
+                        for key in ("left", "top", "width", "height")
+                    }
+                    raw = sct.grab(grab_region)
                     img = Image.frombytes("RGB", raw.size, raw.bgra, "raw", "BGRX")
                     path = _get_next_path()
                     img.save(path, format="JPEG", quality=60)
@@ -650,7 +790,10 @@ def tool_screenshot() -> tuple[str, str | None]:
                     b64 = base64.b64encode(buf.getvalue()).decode()
                     extra = f' title="{title}"' if title else ""
                     return (
-                        f"screenshot saved: {path} ({img.size[0]}x{img.size[1]}) mode=focused_window{extra}",
+                        f"screenshot saved: {path} ({img.size[0]}x{img.size[1]}) "
+                        f"mode=focused_window "
+                        f'origin=({region["left"]},{region["top"]}) '
+                        f'dpi_scale={region.get("dpi_scale", 1.0):.2f}{extra}',
                         b64,
                     )
                 except Exception:

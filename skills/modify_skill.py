@@ -1,5 +1,4 @@
-from pathlib import Path
-from core.models import ROOT
+from core import skill_sandbox
 
 DESCRIPTION = "Modify or update an existing skill file in skills/."
 PARAMETERS = {
@@ -13,12 +12,4 @@ PARAMETERS = {
 
 
 def HANDLER(skill_name: str, code: str) -> str:
-    name = Path(skill_name.strip()).name.removesuffix(".py")
-    skills_dir = (ROOT / "skills").resolve()
-    p = (skills_dir / f"{name}.py").resolve()
-    if not str(p).startswith(str(skills_dir)):
-        return f"error: path outside skills directory"
-    if not p.exists():
-        return f"error: skill {name}.py does not exist"
-    p.write_text(code, encoding="utf-8")
-    return f"updated skill {p.name}"
+    return skill_sandbox.verify_and_deploy_skill(skill_name, code, overwrite=True)

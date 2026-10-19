@@ -144,7 +144,6 @@ class ContextManager:
                 loaded = persistence.load_dag_nodes(self.task_id)
                 if loaded is None or not loaded[0]:
                     persistence.save_checkpoint(self.task_id, self.messages, branch=self.branch)
-                self.branch = persistence.get_current_branch(self.task_id)
                 node = persistence.append_dag_node(
                     self.task_id,
                     raw_copy,

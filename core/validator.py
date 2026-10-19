@@ -56,8 +56,28 @@ class ToolValidator:
                 return ValidationResult(is_valid=False, error_message=f"mouse action '{action}' is invalid")
             for coord in ("x", "y"):
                 val = args.get(coord, 0)
-                if not isinstance(val, (int, float)) or val < 0:
-                    return ValidationResult(is_valid=False, error_message=f"mouse coordinate '{coord}' must be a non-negative number")
+                if (
+                    not isinstance(val, (int, float))
+                    or isinstance(val, bool)
+                    or not (-32768 <= val <= 32767)
+                ):
+                    return ValidationResult(
+                        is_valid=False,
+                        error_message=(
+                            f"mouse coordinate '{coord}' must be a number within "
+                            "virtual desktop bounds [-32768, 32767]"
+                        ),
+                    )
+            control_id = args.get("control_id")
+            if control_id is not None and (
+                not isinstance(control_id, int)
+                or isinstance(control_id, bool)
+                or control_id < 1
+            ):
+                return ValidationResult(
+                    is_valid=False,
+                    error_message="mouse 'control_id' must be a positive integer",
+                )
 
         elif name == "keyboard":
             action = args.get("action", "type")

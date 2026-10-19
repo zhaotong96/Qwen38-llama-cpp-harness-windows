@@ -40,6 +40,7 @@ from core.models import (
     SCREEN_PATH,
 )
 from core import persistence
+from core import skill_sandbox
 from core.persistence import (
     append_stream_event,
     generate_task_id,
@@ -150,10 +151,14 @@ class Agent:
     """Core Agent class encapsulating conversation loop, skill dispatch, and execution state."""
 
     RISKY_TOOLS = frozenset(
-        {"shell", "write_file", "patch", "git", "mouse", "keyboard", "subagent", "add_skill", "modify_skill"}
+        {
+            "shell", "write_file", "patch", "git", "mouse", "keyboard",
+            "subagent", "add_skill", "modify_skill", "branch_rewind",
+        }
     )
     READ_TIMEOUT_BASE = 300.0
     READ_TIMEOUT_TOKENS_PER_SECOND = 400
+    TDD_TEST_PATTERN = re.compile(r"\b(?:unittest|pytest)\b", re.IGNORECASE)
 
     def __init__(
         self,
@@ -345,6 +350,63 @@ class Agent:
         if mode == "step_risky":
             return tool_name in self.RISKY_TOOLS
         return False
+
+    def _pending_tdd_write(self) -> str | None:
+        """Derive unverified .py writes from the current branch's disk history."""
+        if not self.current_task_id:
+            return None
+        with self._scoped_persistence():
+            chain = persistence.build_branch_nodes(
+                self.current_task_id, self.context.branch
+            )
+        tool_results: dict[str, str] = {}
+        for node in chain:
+            if node.get("role") == "tool" and node.get("tool_call_id"):
+                tool_results[str(node["tool_call_id"])] = str(node.get("content") or "")
+
+        pending_path: str | None = None
+        for node in chain:
+            for tool_call in node.get("tool_calls") or []:
+                if not isinstance(tool_call, dict):
+                    continue
+                function = tool_call.get("function") or {}
+                tool_name = str(function.get("name") or "")
+                try:
+                    tool_args = json.loads(function.get("arguments") or "{}")
+                except Exception:
+                    tool_args = {}
+                if not isinstance(tool_args, dict):
+                    tool_args = {}
+
+                output = tool_results.get(str(tool_call.get("id") or ""), "")
+                output_failed = output.lstrip().lower().startswith("error") or (
+                    output.startswith("[EXECUTION_REJECTED]")
+                    or output.startswith("[EXECUTION_INTERRUPTED_AND_IGNORED]")
+                )
+
+                if tool_name in ("add_skill", "modify_skill"):
+                    target = str(tool_args.get("skill_name") or "").strip()
+                    if target and not output_failed:
+                        pending_path = f"skills/{target.removesuffix('.py')}.py"
+                elif tool_name in ("write_file", "patch"):
+                    target = str(tool_args.get("path") or "").strip()
+                    if target.endswith(".py") and not output_failed:
+                        pending_path = target
+                elif tool_name == "shell":
+                    command = str(tool_args.get("command") or "")
+                    if not self.TDD_TEST_PATTERN.search(command):
+                        continue
+                    if re.search(r"(?m)^exit=0\s*$", output):
+                        pending_path = None
+        return pending_path
+
+    def _tdd_gate_message(self, pending_path: str) -> str:
+        return (
+            f"[TDD_VERIFICATION_GATE] '{pending_path}' was modified on this branch "
+            "without a subsequent passing test run (exit=0). TASK_DONE is rejected. "
+            "Run `python -m unittest` or `pytest`, verify the result, and only then "
+            "report TASK_DONE."
+        )
 
     def _pause_for_operator(self, step_id: str, round_i: int, tool_name: str) -> dict[str, Any] | None:
         """Persist paused_before_tool and block until release or abort.
@@ -619,6 +681,7 @@ class Agent:
         "[Operator correction]",
         "[EXECUTION_REJECTED]",
         "[EXECUTION_INTERRUPTED_AND_IGNORED]",
+        "[Branch Rewind Lesson]",
     )
     _SECTION4_HEADING = "4. 被否决方案与操作员红线（永久保留）"
     _REDLINE_PLACEHOLDERS = frozenset({"无", "none", "n/a", "(none)", "-"})
@@ -1022,6 +1085,33 @@ class Agent:
                     round_sigs.append(sig)
                     self.logger.info(f"-> {name}({json.dumps(args, ensure_ascii=False)[:200]})")
 
+                    if name == "task_done":
+                        pending_path = self._pending_tdd_write()
+                        if pending_path:
+                            gate_msg = self._tdd_gate_message(pending_path)
+                            self.logger.warning(f"[tdd-gate] {gate_msg}")
+                            with self._scoped_persistence():
+                                self.context.append(
+                                    {
+                                        "role": "tool",
+                                        "tool_call_id": tc.id,
+                                        "content": gate_msg,
+                                    },
+                                    meta={"step_id": step_id, "tdd_gate": True},
+                                )
+                            self.observer.emit(
+                                self.current_task_id,
+                                "tool_rejected",
+                                {
+                                    "tool": name,
+                                    "tool_call_id": tc.id,
+                                    "reason": "TDD_VERIFICATION_GATE",
+                                },
+                                step_id=step_id,
+                                tasks_root=self._tasks_root,
+                            )
+                            continue
+
                     # Pre-Dispatch Operator Breakpoint (step_risky / step_all)
                     if self._should_pause_before_tool(name):
                         pause_abort = self._pause_for_operator(step_id, round_i, name)
@@ -1073,16 +1163,56 @@ class Agent:
                         parent_task_id=self.parent_task_id,
                     )
                     fn = self.dispatchers.get(name)
+                    handler_failed = False
                     try:
                         if fn:
                             try:
                                 res = fn(args)
                             except Exception as e:
+                                handler_failed = True
                                 res = f"error executing {name}: {e}"
                         else:
                             res = f"error: unknown tool {name}"
                     finally:
                         set_active_execution_context(None)
+
+                    if fn:
+                        result_text = res[0] if isinstance(res, tuple) else res
+                        if (
+                            isinstance(result_text, str)
+                            and result_text.lstrip().lower().startswith("error")
+                        ):
+                            handler_failed = True
+                        quarantine_note = None
+                        try:
+                            quarantine_note = skill_sandbox.record_skill_outcome(
+                                name,
+                                succeeded=not handler_failed,
+                                error_detail=str(result_text)[:300],
+                            )
+                        except Exception as health_err:
+                            self.logger.warning(
+                                f"[skill-health] failed to record {name}: {health_err}"
+                            )
+
+                        if quarantine_note:
+                            if isinstance(res, tuple):
+                                res = (f"{result_text}\n\n{quarantine_note}", res[1])
+                            else:
+                                res = f"{result_text}\n\n{quarantine_note}"
+
+                        should_reload = (
+                            name in ("add_skill", "modify_skill") and not handler_failed
+                        ) or bool(quarantine_note)
+                        if should_reload:
+                            try:
+                                self.reload_skills()
+                            except Exception as reload_err:
+                                reload_note = f"error: skill reload failed: {reload_err}"
+                                if isinstance(res, tuple):
+                                    res = (f"{res[0]}\n{reload_note}", res[1])
+                                else:
+                                    res = f"{res}\n{reload_note}"
 
                     # Gate 3: Mid/Post-Execution Interrupt & Output Ignore Gate
                     post_abort = self._is_step_rejected()
@@ -1249,6 +1379,15 @@ class Agent:
                         }
                     )
                 continue
+
+            if "TASK_DONE" in last:
+                pending_path = self._pending_tdd_write()
+                if pending_path:
+                    gate_msg = self._tdd_gate_message(pending_path)
+                    self.logger.warning(f"[tdd-gate] {gate_msg}")
+                    with self._scoped_persistence():
+                        self.context.append({"role": "user", "content": gate_msg})
+                    continue
 
             return last
 
