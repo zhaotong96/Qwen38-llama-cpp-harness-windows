@@ -537,6 +537,28 @@ def trunc(s: str, n: int = 12000) -> str:
     return s if len(s) <= n else s[:n] + f"\n...[{len(s) - n} more chars]"
 
 
+def window_rect_ex(hwnd: int) -> "wintypes.RECT | None":
+    """Shadow-free physical bounds of one HWND (DWM extended frame, GetWindowRect fallback)."""
+    if sys.platform != "win32" or not hwnd:
+        return None
+    rect = wintypes.RECT()
+    if _dwmapi is not None:
+        try:
+            hr = _dwmapi.DwmGetWindowAttribute(
+                wintypes.HWND(hwnd),
+                wintypes.DWORD(DWMWA_EXTENDED_FRAME_BOUNDS),
+                ctypes.byref(rect),
+                ctypes.sizeof(rect),
+            )
+            if hr == 0:
+                return rect
+        except Exception:
+            pass
+    if _user32.GetWindowRect(hwnd, ctypes.byref(rect)):
+        return rect
+    return None
+
+
 def foreground_window() -> tuple[dict, str] | None:
     """Return DWM physical bounds (shadow-free), HWND, title, and DPI scale."""
     if sys.platform != "win32":
@@ -551,20 +573,8 @@ def foreground_window() -> tuple[dict, str] | None:
         _user32.GetWindowTextW(hwnd, buf, n + 1)
         title = (buf.value or "").strip() or "(no title)"
 
-        rect = wintypes.RECT()
-        got_dwm = False
-        if _dwmapi is not None:
-            try:
-                hr = _dwmapi.DwmGetWindowAttribute(
-                    wintypes.HWND(hwnd),
-                    wintypes.DWORD(DWMWA_EXTENDED_FRAME_BOUNDS),
-                    ctypes.byref(rect),
-                    ctypes.sizeof(rect),
-                )
-                got_dwm = hr == 0
-            except Exception:
-                got_dwm = False
-        if not got_dwm and not _user32.GetWindowRect(hwnd, ctypes.byref(rect)):
+        rect = window_rect_ex(hwnd)
+        if rect is None:
             return None
 
         left, top, right, bottom = rect.left, rect.top, rect.right, rect.bottom

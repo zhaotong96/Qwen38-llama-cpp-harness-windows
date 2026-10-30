@@ -21,7 +21,12 @@ import time
 from typing import Any
 
 from core.models import AGENT_DIR
-from core.tools import execution_aborted, probe_desktop_session_state
+from core.tools import (
+    execution_aborted,
+    get_window_dpi_scale,
+    probe_desktop_session_state,
+    window_rect_ex,
+)
 
 DESCRIPTION = (
     "Extract the interactive UI Automation control tree (ID, Role, Name, "
@@ -434,6 +439,28 @@ def _format_outline(hwnd: int, controls: list[dict[str, Any]], timeout_ms: int, 
     return "\n".join(lines)
 
 
+def _window_projection(hwnd: int) -> dict[str, Any]:
+    """Best-effort physical origin, DPI scale, and title for the Web canvas overlay."""
+    projection: dict[str, Any] = {"origin": [0, 0], "dpi_scale": 1.0, "window_title": ""}
+    try:
+        from ctypes import wintypes
+
+        rect = window_rect_ex(hwnd)
+        if rect is not None:
+            projection["origin"] = [int(rect.left), int(rect.top)]
+        dpi_scale = get_window_dpi_scale(hwnd)
+        if dpi_scale:
+            projection["dpi_scale"] = float(dpi_scale)
+        user32 = _user32_api()
+        length = user32.GetWindowTextLengthW(wintypes.HWND(hwnd))
+        buffer = ctypes.create_unicode_buffer(length + 1)
+        user32.GetWindowTextW(wintypes.HWND(hwnd), buffer, length + 1)
+        projection["window_title"] = buffer.value or ""
+    except Exception:
+        pass
+    return projection
+
+
 def run(args: dict, runtime: dict | None = None) -> str:
     if sys.platform != "win32":
         return "error: ui_tree is only supported on Windows"
@@ -477,7 +504,15 @@ def run(args: dict, runtime: dict | None = None) -> str:
         return f"error: UIA extraction failed: {sink['error']}"
 
     controls = sink.get("controls", [])
-    payload = {"hwnd": hwnd, "count": len(controls), "controls": controls}
+    projection = _window_projection(hwnd)
+    payload = {
+        "hwnd": hwnd,
+        "count": len(controls),
+        "window_title": projection["window_title"],
+        "origin": projection["origin"],
+        "dpi_scale": projection["dpi_scale"],
+        "controls": controls,
+    }
     try:
         UI_TREE_CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
         UI_TREE_CACHE_PATH.write_text(

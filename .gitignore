@@ -8,6 +8,7 @@ __pycache__/
 # The runtime rule file .agent/AGENTS.md is the ONLY tracked file under .agent/
 .agent/*
 !.agent/AGENTS.md
+*.gdoc
 
 # Application logs
 logs/*

@@ -4,8 +4,11 @@
  */
 import { renderDagTree, renderBranchBar, contentToText } from "./tree_view.js";
 import { renderQueuePanel } from "./queue_panel.js";
-import { renderFactLedger } from "./fact_ledger.js";
+import { renderFactLedger, parseLedger } from "./fact_ledger.js";
 import { bindInspector, openInspector } from "./inspector.js";
+import { store } from "./store.js";
+import "./canvas_overlay.js";
+import "./dag_timeline.js";
 
 const STREAM_CAP = 200000;
 const DELTA_EVENTS = ["reasoning_delta", "content_delta", "tool_call_delta", "tool_start", "tool_rejected", "tool_interrupted"];
@@ -89,6 +92,79 @@ function resetStream() {
   const stepLabel = el("stream-step-label");
   if (stepLabel) stepLabel.textContent = "实时解码流 (Idle)";
   updateCharLabel();
+}
+
+function ledgerSection4Lines(treeData) {
+  const nodes = (treeData && treeData.nodes) || [];
+  const branches = (treeData && treeData.branches) || {};
+  const branch = (treeData && treeData.current_branch) || "main";
+  const nodeMap = new Map(nodes.map((n) => [n.id, n]));
+  const chain = [];
+  let currId = branches[branch] || (nodes.length ? nodes[nodes.length - 1].id : null);
+  const visited = new Set();
+  while (currId && nodeMap.has(currId) && !visited.has(currId)) {
+    visited.add(currId);
+    const node = nodeMap.get(currId);
+    chain.push(node);
+    currId = node.parent_id;
+  }
+  for (let i = chain.length - 1; i >= 0; i -= 1) {
+    if (chain[i].type === "compaction") {
+      const section4 = parseLedger(chain[i].content).find((section) => section.index === 4);
+      return section4 ? section4.body.split("\n").filter((line) => line.trim()) : [];
+    }
+  }
+  const lines = [];
+  for (const node of chain) {
+    const text = contentToText(node.content);
+    if (!text.includes("[Branch Rewind Lesson]")) continue;
+    for (const line of text.split("\n")) {
+      const trimmed = line.trim();
+      if (trimmed.includes("[Branch Rewind Lesson]") && !lines.includes(trimmed)) lines.push(trimmed);
+    }
+  }
+  return lines;
+}
+
+async function projectConsoleOverlays(ticket, tree) {
+  const session = state.currentSession;
+  if (!session) {
+    store.patch(
+      { taskId: null, status: "idle", dag: { ...store.state.dag, rewindEvents: [] }, factLedgerSection4: [] },
+      ["dag", "ledger"]
+    );
+    return;
+  }
+  const [screensRes, uiTreeRes, rewindRes] = await Promise.all([
+    apiCall("GET", "/screens"),
+    apiCall("GET", `/tasks/${session}/ui_tree`),
+    apiCall("GET", `/tasks/${session}/rewind_ledger`),
+  ]);
+  if (ticket !== state.refreshTicket) return;
+
+  const screens = Array.isArray(screensRes.data && screensRes.data.screens) ? screensRes.data.screens : [];
+  const latestScreen = screens.length ? screens[screens.length - 1] : null;
+  const nextUrl = latestScreen ? latestScreen.url : null;
+  if (store.state.screenshot.url !== nextUrl) {
+    store.patch({ screenshot: { ...store.state.screenshot, url: nextUrl } }, ["screenshot"]);
+  }
+
+  if (uiTreeRes.status === 200) {
+    store.setUiTreeSnapshot(uiTreeRes.data);
+  }
+
+  const rewindEvents = Array.isArray(rewindRes.data) ? rewindRes.data : [];
+  store.patch(
+    {
+      taskId: session,
+      status: (tree && tree.step_state && tree.step_state.phase) || (state.busy ? "running" : "idle"),
+      dag: { ...store.state.dag, currentBranch: state.currentBranch || "main", rewindEvents },
+      factLedgerSection4: ledgerSection4Lines(tree),
+    },
+    ["dag", "ledger"]
+  );
+  const drawerSummary = el("dag-drawer-summary");
+  if (drawerSummary) drawerSummary.textContent = `回溯事件: ${rewindEvents.length}`;
 }
 
 function renderEmptyProjection(treeHint, messageHint) {
@@ -293,6 +369,9 @@ async function refreshAll() {
     renderEmptyProjection("暂无会话，提交任务后实时映射 checkpoint.jsonl", "暂无对话历史");
   }
 
+  // Project the canvas overlay / rewind timeline slices from read-only disk state.
+  await projectConsoleOverlays(ticket, state.tree);
+
   // Render Unified Queue
   state.queue = queueData.queue || [];
   renderQueuePanel(
@@ -476,6 +555,24 @@ function bindEvents() {
   el("btn-refresh")?.addEventListener("click", () => {
     setNotice("正在重新拉取磁盘投影…");
     refreshAll();
+  });
+
+  el("btn-dag-timeline")?.addEventListener("click", () => {
+    el("dag-timeline-drawer")?.classList.toggle("open");
+  });
+
+  el("btn-close-dag-drawer")?.addEventListener("click", () => {
+    el("dag-timeline-drawer")?.classList.remove("open");
+  });
+
+  // One-click "point & shoot": canvas clicks auto-fill the operator box.
+  store.addEventListener("slice:intervention", () => {
+    const input = el("task-input");
+    const draft = store.state.interventionDraft;
+    if (!input || !draft) return;
+    input.value = draft;
+    input.focus();
+    setNotice("画布目标已一键填充指令框，可直接执行或入队下发干预", "ok");
   });
 
   el("step-mode-select")?.addEventListener("change", async (event) => {

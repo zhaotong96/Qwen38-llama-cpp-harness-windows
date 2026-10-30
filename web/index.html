@@ -34,6 +34,9 @@
       <button id="btn-interrupt" class="btn btn-danger" title="Write .agent/tasks/<id>/abort.flag immediately">
         强制打断 / 拒绝执行 (Interrupt)
       </button>
+      <button id="btn-dag-timeline" class="btn btn-secondary" title="因果回溯时间轴 (rewind_ledger.jsonl)">
+        因果回溯时间轴
+      </button>
       <button id="btn-refresh" class="btn btn-secondary">刷新磁盘投影</button>
     </div>
   </header>
@@ -47,6 +50,19 @@
       </div>
     </div>
     <pre class="inspector-json" id="inspector-json"></pre>
+  </aside>
+
+  <aside id="dag-timeline-drawer" class="dag-drawer" aria-hidden="true">
+    <div class="dag-drawer-header">
+      <h2>因果回溯时间轴 (Branch Rewind Ledger)</h2>
+      <div class="inspector-actions">
+        <span class="mono-meta" id="dag-drawer-summary"></span>
+        <button type="button" id="btn-close-dag-drawer" class="btn btn-small">关闭</button>
+      </div>
+    </div>
+    <div class="dag-drawer-body">
+      <agent-dag-timeline id="agent-dag-timeline"></agent-dag-timeline>
+    </div>
   </aside>
 
   <main class="workspace-grid">
@@ -89,6 +105,10 @@
       <div class="panel-header">
         <h2>实时流式总线 &amp; 活跃分支上下文 (SSE + live_stream.jsonl)</h2>
         <span class="mono-meta" id="model-info-badge">model: local-model</span>
+      </div>
+
+      <div class="screen-stage">
+        <agent-canvas-overlay id="agent-canvas-overlay"></agent-canvas-overlay>
       </div>
 
       <div class="live-stream-banner" id="live-stream-banner">

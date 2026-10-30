@@ -1,3 +1,0 @@
-Completed Phase 8B (skill sandbox), Phase 8A (DPI/UIA automation), and Phase 9A (context race fix, branch rewind, TDD gate). Finished diff review and hardened the TDD gate so failed `.py` writes do not open it; also added overwrite-deploy coverage.
-
-Verification: `232 tests OK`, repo hygiene OK, `requirements.txt` still 4 dependencies, `web/` untouched. Changes remain uncommitted; tell me if you want a commit.

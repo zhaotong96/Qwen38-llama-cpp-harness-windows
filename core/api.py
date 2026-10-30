@@ -30,7 +30,7 @@ from core.agent import Agent
 from core.config import load_config
 from core import interrupt
 from core.logger import setup_logger
-from core.models import INBOX, ROOT, WEB_DIR
+from core.models import AGENT_DIR, INBOX, ROOT, SCREEN_PATH, WEB_DIR
 from core import persistence
 from core.persistence import (
     CHECKPOINT_FILE,
@@ -58,6 +58,13 @@ from core import subagent_runner
 
 logger = setup_logger()
 
+# Read-only disk projections backing the zero-build Web console canvas overlay.
+# ui_tree_last.json is the shared UIA cache written by skills/ui_tree.py;
+# rewind_ledger.jsonl lives inside each task directory (skills/branch_rewind.py).
+UI_TREE_CACHE = AGENT_DIR / "ui_tree_last.json"
+SCREENSHOTS_DIR = SCREEN_PATH.parent
+REWIND_LEDGER_FILE = "rewind_ledger.jsonl"
+
 INDEX = {
     "name": "gemma4-agent-windows unified web & api harness",
     "description": (
@@ -76,6 +83,10 @@ INDEX = {
         "POST   /tasks                       body: {\"task\": \"...\"}",
         "POST   /tasks/<id>/resume           body: {\"branch\": \"...\"} (optional)",
         "GET    /tasks/<id>/tree",
+        "GET    /tasks/<id>/ui_tree          UIA snapshot + screenshot origin & dpi_scale",
+        "GET    /tasks/<id>/rewind_ledger    causal rewind ledger (JSON array)",
+        "GET    /screens                     list captured screenshots",
+        "GET    /screens/<name>              serve one captured screenshot (JPEG)",
         "GET    /tasks/<id>/branches",
         "POST   /tasks/<id>/branches         body: {\"name\": \"...\", \"from_node_id\": \"...\", \"checkout\": true}",
         "POST   /tasks/<id>/checkout         body: {\"branch\": \"...\"}",
@@ -272,7 +283,7 @@ class Handler(BaseHTTPRequestHandler):
             return None
         return data
 
-    def _json(self, code: int, payload: dict[str, Any]) -> None:
+    def _json(self, code: int, payload: dict[str, Any] | list[Any]) -> None:
         data = json.dumps(payload, ensure_ascii=False, default=str).encode("utf-8")
         self.send_response(code)
         self.send_header("Content-Type", "application/json; charset=utf-8")
@@ -318,6 +329,14 @@ class Handler(BaseHTTPRequestHandler):
             return self._task_detail(parts[1])
         if len(parts) == 3 and parts[0] == "tasks" and parts[2] == "tree":
             return self._task_tree(parts[1])
+        if len(parts) == 3 and parts[0] == "tasks" and parts[2] == "ui_tree":
+            return self._task_ui_tree(parts[1])
+        if len(parts) == 3 and parts[0] == "tasks" and parts[2] == "rewind_ledger":
+            return self._task_rewind_ledger(parts[1])
+        if parts == ["screens"]:
+            return self._list_screens()
+        if len(parts) == 2 and parts[0] == "screens":
+            return self._serve_screenshot(parts[1])
         if len(parts) == 3 and parts[0] == "tasks" and parts[2] == "branches":
             return self._task_branches(parts[1])
         if len(parts) == 3 and parts[0] == "tasks" and parts[2] == "step_state":
@@ -455,6 +474,86 @@ class Handler(BaseHTTPRequestHandler):
         if tree is None:
             return self._json(404, {"error": f"unknown task: {task_id}"})
         self._json(200, tree)
+
+    def _task_ui_tree(self, task_id: str) -> None:
+        """Read-only projection of .agent/ui_tree_last.json plus overlay geometry."""
+        try:
+            persistence._validate_identifier(task_id, "task id")
+        except ValueError:
+            return self._json(404, {"error": f"unknown task: {task_id}"})
+        payload: dict[str, Any] = {}
+        if UI_TREE_CACHE.is_file():
+            try:
+                loaded = json.loads(UI_TREE_CACHE.read_text(encoding="utf-8"))
+                if isinstance(loaded, dict):
+                    payload = loaded
+            except Exception:
+                payload = {}
+        controls = payload.get("controls") if isinstance(payload.get("controls"), list) else []
+        origin = payload.get("origin")
+        if not (isinstance(origin, (list, tuple)) and len(origin) == 2):
+            origin = (0, 0)
+        self._json(
+            200,
+            {
+                "hwnd": int(payload.get("hwnd") or 0),
+                "window_title": str(payload.get("window_title") or ""),
+                "anemic": not controls,
+                "origin": [int(origin[0]), int(origin[1])],
+                "dpi_scale": float(payload.get("dpi_scale") or 1.0),
+                "count": len(controls),
+                "controls": controls,
+            },
+        )
+
+    def _task_rewind_ledger(self, task_id: str) -> None:
+        """Read-only projection of .agent/tasks/<id>/rewind_ledger.jsonl (empty array if absent)."""
+        try:
+            persistence._validate_identifier(task_id, "task id")
+        except ValueError:
+            return self._json(404, {"error": f"unknown task: {task_id}"})
+        events: list[dict[str, Any]] = []
+        path = TASKS_ROOT / task_id / REWIND_LEDGER_FILE
+        if path.is_file():
+            try:
+                for line in path.read_text(encoding="utf-8").splitlines():
+                    if line.strip():
+                        value = json.loads(line)
+                        if isinstance(value, dict):
+                            events.append(value)
+            except Exception:
+                pass
+        self._json(200, events)
+
+    def _list_screens(self) -> None:
+        """List captured screenshots (oldest first) so the console can pick the latest."""
+        screens: list[dict[str, Any]] = []
+        if SCREENSHOTS_DIR.is_dir():
+            for path in sorted(SCREENSHOTS_DIR.glob("*.jpg")):
+                stat = path.stat()
+                screens.append(
+                    {
+                        "name": path.name,
+                        "url": f"/screens/{path.name}",
+                        "size": stat.st_size,
+                        "mtime": datetime.fromtimestamp(stat.st_mtime).isoformat(timespec="seconds"),
+                    }
+                )
+        self._json(200, {"screens": screens})
+
+    def _serve_screenshot(self, name: str) -> None:
+        if "/" in name or "\\" in name or ".." in name or not name.lower().endswith(".jpg"):
+            return self._json(400, {"error": "invalid screenshot name"})
+        path = SCREENSHOTS_DIR / name
+        if not path.is_file():
+            return self._json(404, {"error": f"screenshot not found: {name}"})
+        raw = path.read_bytes()
+        self.send_response(200)
+        self.send_header("Content-Type", "image/jpeg")
+        self.send_header("Cache-Control", "no-cache")
+        self.send_header("Content-Length", str(len(raw)))
+        self.end_headers()
+        self.wfile.write(raw)
 
     def _task_branches(self, task_id: str) -> None:
         try:

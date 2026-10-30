@@ -50,26 +50,28 @@ def _resolve_control_center(control_id: int) -> tuple[int, int, str] | None:
 
 
 def _virtual_desktop_norm(px: int, py: int, user32) -> tuple[int, int, int, int]:
-    """Map physical desktop pixels to the [0, 65535] MOUSEEVENTF_VIRTUALDESK space."""
+    """Map physical desktop pixels to [0, 65535] MOUSEEVENTF_VIRTUALDESK space via zero-drift ceiling bijection."""
     origin_x = int(user32.GetSystemMetrics(76))
     origin_y = int(user32.GetSystemMetrics(77))
     width = max(2, int(user32.GetSystemMetrics(78)))
     height = max(2, int(user32.GetSystemMetrics(79)))
-    clamped_x = max(origin_x, min(int(px), origin_x + width - 1))
-    clamped_y = max(origin_y, min(int(py), origin_y + height - 1))
-    norm_x = ((clamped_x - origin_x) * 65535 + (width - 1) // 2) // (width - 1)
-    norm_y = ((clamped_y - origin_y) * 65535 + (height - 1) // 2) // (height - 1)
+    span_x = width - 1
+    span_y = height - 1
+    clamped_x = max(origin_x, min(int(px), origin_x + span_x))
+    clamped_y = max(origin_y, min(int(py), origin_y + span_y))
+    norm_x = ((clamped_x - origin_x) * 65535 + (span_x - 1)) // span_x
+    norm_y = ((clamped_y - origin_y) * 65535 + (span_y - 1)) // span_y
     return clamped_x, clamped_y, norm_x, norm_y
 
 
 def _virtual_desktop_denorm(norm_x: int, norm_y: int, user32) -> tuple[int, int]:
-    """Inverse of ``_virtual_desktop_norm`` for exact round-trip verification."""
+    """Exact win32k.sys floor-truncating fixed-point inverse transform."""
     origin_x = int(user32.GetSystemMetrics(76))
     origin_y = int(user32.GetSystemMetrics(77))
     width = max(2, int(user32.GetSystemMetrics(78)))
     height = max(2, int(user32.GetSystemMetrics(79)))
-    px = origin_x + int(round(int(norm_x) * (width - 1) / 65535))
-    py = origin_y + int(round(int(norm_y) * (height - 1) / 65535))
+    px = origin_x + (int(norm_x) * (width - 1)) // 65535
+    py = origin_y + (int(norm_y) * (height - 1)) // 65535
     return px, py
 
 

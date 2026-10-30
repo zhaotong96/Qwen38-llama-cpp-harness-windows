@@ -98,8 +98,14 @@ Qwen38-llama-cpp-harness-windows/
 ├── tests/                      # 14 个自动化测试套件（107 项测试）
 ├── .agent/                     # 运行时状态（仅 AGENTS.md 纳入版本控制）
 │   └── AGENTS.md               # 核心系统提示词与行为规则
-├── SPEC.md                     # 项目持久化规格说明（权威契约）
-└── requirements.txt            # 运行时依赖清单
+├── docs/                       # 项目文档中心（SPEC, RFC, 任务卡片, 运维手册）
+│   ├── README.md               # 文档导航总览
+│   ├── SPEC.md                 # 项目持久化规格说明（权威契约）
+│   ├── rfc/                    # 架构 RFC 征求意见稿与专家咨询备忘录
+│   ├── tasks/                  # 历史演进与生产实施任务卡片 (Checklists)
+│   ├── ops/                    # 远程模型宿主升级与运维手册
+│   └── notes/                  # 研发笔记与阶段沟通汇报
+└── requirements.txt            # 运行时依赖清单（严格 4 项）
 ```
 
 ---

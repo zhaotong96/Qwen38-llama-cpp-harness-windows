@@ -14,6 +14,13 @@ from core import tools as tools_mod
 from skills import mouse as mouse_mod
 from skills import ui_tree as ui_tree_mod
 
+try:  # pragma: no cover - depends on the environment
+    from PIL import Image as _pil_image  # noqa: F401
+
+    PIL_AVAILABLE = True
+except ImportError:  # bare interpreter without pip packages
+    PIL_AVAILABLE = False
+
 
 class _FakeUser32:
     """Minimal GetSystemMetrics virtual-desktop fake for geometry unit tests."""
@@ -132,11 +139,8 @@ class ForegroundWindowDwmTests(unittest.TestCase):
         self.assertEqual(region["width"], 1000)
         self.assertEqual(region["height"], 800)
 
+    @unittest.skipUnless(PIL_AVAILABLE, "pillow package not installed")
     def test_screenshot_reports_origin_and_dpi_scale(self):
-        import io
-
-        from PIL import Image
-
         raw = type("Raw", (), {})()
         raw.size = (200, 100)
         raw.bgra = bytes([0, 0, 0, 255]) * 200 * 100
