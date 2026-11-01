@@ -45,10 +45,18 @@ core/
   config.py      load_config()：唯一配置装配入口（探测模型窗口并推导预算）
   models.py      路径与常量（ROOT、.agent/、logs/）+ 端点环境变量
   tools.py       内置工具实现 + skill 发现（discover_skills）
-  context.py     会话消息、token 估算、截图裁剪、上下文压缩
+  context.py     会话消息、token 估算、截图裁剪、上下文压缩、尾端暂态 GC
+  token_grid.py  /tokenize 精确计数缓存、1024-Token 骨架网格对齐、缓存遥测审计
   validator.py   参数校验（schema）与死循环防护（repetition guard）
   persistence.py .agent/tasks/<id>/{checkpoint.jsonl,status} 读写 + list_tasks
-skills/*.py      能力文件（见 §4）
+  interrupt.py   三道打断门禁（abort.flag / step_state / 输出忽略）与崩溃自愈
+  queue_manager.py 显式文件基双端同步队列（.agent/queue/）
+  subagent_runner.py 单实例 SubAgent 沙箱运行器（active.lock 互斥）
+  subagent_gate.py   SubAgent Git Worktree 隔离、防篡改产物卡片与风险门禁
+  skill_sandbox.py   动态技能 AST 纯度沙箱、schema 校验、干运行准入与三振隔离
+  macro_compiler.py  成功轨迹宏结晶编译器（污点槽位 + AST 纯度代码发射）
+  logger.py      控制台与文件日志输出
+skills/*.py      能力文件（见 §4；含 subagent_review 审查裁决、crystallize_macro 宏结晶）
 tests/           单元/集成测试（见 §11）
 .agent/          运行时状态（见 §5）：AGENTS.md、GOAL.md、tasks/、inbox/
 logs/            agent.log（运行日志）、safety_guard.log（安全拦截记录）
@@ -111,6 +119,9 @@ def run(args: dict, runtime: dict) -> str   # 方式二：需要运行时上下�
 | `.agent/screen_*.jpg` | JPEG | 截图 skill | 最近截图（上下文中仅保留少量，旧图以文字路径占位） |
 | `.agent/AGENTS.md` | Markdown | 人工维护 | **必需**的系统提示（运行规则）；agent 启动与每次构建系统提示时读取，缺失即报错，无内置默认提示 |
 | `.agent/GOAL.md` | Markdown | `--goal` 模式下由 LLM 生成 | 长期目标（可选）；goal 模式强制循环至 TASK_DONE/TASK_BLOCKED |
+| `.agent/subagents/<sub_id>/` | 目录 | `core.subagent_runner` | SubAgent 沙箱：`checkpoint.jsonl`、`status`（completed/failed/cancelled）、`artifact_card.json`（宿主生成的防篡改交付卡片） |
+| `.agent/worktrees/<sub_id>/` | Git worktree | `core.subagent_gate` | SubAgent 物理隔离工作树（分支 `subtask_<sub_id>`）；父级审查后 `--ff-only` 合并或销毁 |
+| `.agent/skills_staging/`、`.agent/skills_disabled/`、`.agent/skill_health.json` | 目录/JSON | `core.skill_sandbox` | 动态技能准入暂存区、三振隔离区与运行健康账本 |
 | `logs/agent.log` | 文本 | `core/logger.py` | 运行日志（CLI 与 API 同时追加写入） |
 | `logs/safety_guard.log` | 文本 | `core/tools.log_safety` | 危险命令拦截、inbox 解析失败等安全记录 |
 
@@ -224,6 +235,7 @@ curl -X POST http://127.0.0.1:8765/inbox -d '{"message":"跳过登录，直接�
 4. **第三方数据清理**（已决）：`.agent/GOAL.md.bak`（含外部账号信息）已从仓库移除；工作区隐私基线由 `tests/test_repo_hygiene.py` 守护。
 5. **保留的已知边界**：CLI 单次运行与 API 服务并发写同一任务目录属未定义行为（正常使用中不会发生：任务 id 微秒级唯一，且各自写各自目录）；git 历史中仍保留旧提交的敏感内容，推送前需按 §12 处理。
 6. **作废外部异构重构尝试（dsh）**（已决）：正式作废在外部试验目录中尝试的 TypeScript / Node.js 重构项目。原因在于其引入不可变内存树、长驻事件总线、私有编译链与异构运行环境，违背奥卡姆剃刀与极简轻量原则，造成严重心智负担与黑盒化倾向。未来所有 WebUI 与树状分支演进均基于当前 Python 原生核心（`core/` + `core/api.py`）以极简、透明、无黑盒的文件基方式演进（见 §13）。
+7. **Phase 11 认知自治四机制**（已决）：(a) 尾端锚定上下文 GC 只折叠内存投影，磁盘 DAG 永不篡改，折叠信息固化为 `[Transient Attempt Pruned: ...]` 因果徽标；(b) 1024-Token 网格对齐仅使用零语义 `\n---` 结构分隔线，严禁任何 `<!-- pad -->` 注释填充；(c) SubAgent 全程运行在 `.agent/worktrees/<id>` Git worktree 中，交付卡片客观字段由宿主从 Git 确定性计算；(d) 结晶宏主定位符严禁硬编码绝对屏幕像素，界面改版必须返回 `[MACRO_STALE_HANDOVER]` 断点热交接而非崩溃。
 
 ---
 
@@ -238,6 +250,10 @@ curl -X POST http://127.0.0.1:8765/inbox -d '{"message":"跳过登录，直接�
 | `test_persistence.py` | task_id 唯一性、checkpoint 往返、status 标记读写、list_tasks（含旧任务 `unknown`）、非法 id 拒绝 |
 | `test_validator.py` | 参数 schema 校验、单调用与批量重复死循环防护、reset |
 | `test_context.py` | token 估算、截图保留与降级、上下文压缩、clear_task |
+| `test_context_gc.py` | Phase 11A 尾端暂态 GC：单工具折叠、多轮试错链折叠、TDD 门禁咬合、红线豁免、深历史窗口保护、拓扑保真、磁盘不可变 |
+| `test_token_grid.py` | Phase 11B：/tokenize 精确计数与 SHA-1 缓存、离线降级、结构分隔线垫片、填充上限、压缩网格对齐、遥测状态机、DAG ckpt_aligned 元数据 |
+| `test_subagent_gate.py` | Phase 11C：Worktree 物理隔离、五类风险标记、防篡改产物卡片、merge --ff-only / revert 裁决、账本教训注入、运行器集成 |
+| `test_macro_compiler.py` | Phase 11D：污点种子提取、因果主干提纯、空间不变性、AST 纯度、沙箱干运行晋升、断点热交接、0-Token 重放 |
 | `test_config.py` | 预算推导、`load_config()` 探测注入、上下文窗口探测（llama.cpp/OpenRouter 字段、不可达与畸形载荷回退）、环境变量覆盖与中性默认值、无默认系统提示 |
 | `test_agent.py` | 系统提示读取（`.agent/AGENTS.md` 必需、缺失即失败）、skill 契约强制与热加载、`collect_stream` 文本/推理/tool_calls 重组与断流传播、goal 模式续跑、max_rounds 终止、run_task/resume_task 的 status+checkpoint 落盘 |
 | `test_skills.py` | 对 `skills/` 全量文件的契约巡检（DESCRIPTION/PARAMETERS/HANDLER|run） |
@@ -263,18 +279,13 @@ pytest            # 兼容运行（见 pytest.ini）
 
 ```bash
 git grep -n -I -E "192\.168\.|MS4w\w+|[d]ouyin[.]com|/home/[a-z]+/bin/"
-py -3 -m unittest tests.test_repo_hygiene -v
+py -3 -m unittest discover -s tests -t . -p test_repo_hygiene.py -v
 ```
 
-推送前必须先重写那一个未推送提交（父提交不变，推送仍是 fast-forward）：
-
-```bash
-git add -A   # 把全部清理、脱敏与规范加固结果并入 init 提交
-git commit --amend --no-edit
-git push
-```
-
-其余改动正常提交即可。若不想改写历史，则不要推送当前分支（或让仓库保持私有）。
+推送安全铁律：
+1. 本地仓库历史已全量脱敏，作者身份统一使用 GitHub noreply 邮箱；
+2. 绝对只推送单一目标分支（`git push origin main`），绝对严禁使用 `git push --all` 或 `git push --mirror`；
+3. 本地若存在任何历史冷备份分支（如 `backup-pre-redact`），仅限离线归档，永不向公开远端推送。
 
 ---
 

@@ -1,9 +1,17 @@
-"""Isolated SubAgent Sandbox Runner (.agent/subagents/)."""
+"""Isolated SubAgent Sandbox Runner (.agent/subagents/).
+
+Phase 11C adds Git-worktree physical isolation: the SubAgent's file tools and
+shell CWD are redirected into ``.agent/worktrees/<id>`` while the objective
+delivery telemetry (diff, hashes, test receipts, hazard flags) is captured
+host-side into an artifact card for the parent's adversarial review.
+"""
 from __future__ import annotations
 
 from datetime import datetime
 import json
+import os
 from pathlib import Path
+import re
 import threading
 from typing import Any
 from unittest import mock
@@ -11,14 +19,30 @@ from unittest import mock
 from core import config as config_mod
 from core import interrupt
 from core import persistence
+from core import tools as tools_mod
 
 
 ACTIVE_LOCK_FILE = "active.lock"
 EXCLUDED_META_SKILLS = frozenset(
-    {"subagent", "add_skill", "modify_skill", "branch_rewind"}
+    {"subagent", "add_skill", "modify_skill", "branch_rewind", "subagent_review", "crystallize_macro"}
 )
 MAX_REPORT_CHARS = 2000
+WORKTREE_WRITE_TOOLS = ("write_file", "patch", "modify_skill", "add_skill")
+_SHELL_EXIT_RE = re.compile(r"(?m)^exit=(\d+)\s*$")
 _subagent_mutex = threading.Lock()
+
+
+def worktree_isolation_enabled() -> bool:
+    """Env kill-switch for Git worktree isolation (default: enabled)."""
+    return os.environ.get("SUBAGENT_WORKTREE", "1").strip().lower() not in (
+        "0", "false", "off", "disabled",
+    )
+
+
+def worktree_repo_root() -> Path:
+    """Repo root the isolation worktree forks from (overridable for tests)."""
+    override = os.environ.get("SUBAGENT_WORKTREE_ROOT", "").strip()
+    return Path(override).resolve() if override else tools_mod.ROOT
 
 
 def subagents_root() -> Path:
@@ -163,9 +187,40 @@ def abort_subagent(sub_id: str | None = None, source: str = "operator", reason: 
     )
 
 
+def _install_telemetry_interception(sub_agent: Any, telemetry: dict[str, Any]) -> None:
+    """Record the objective write/test timeline by wrapping raw dispatchers.
+
+    The SubAgent LLM cannot falsify this telemetry: the host counts every
+    write-family tool call and every shell receipt's exit code itself.
+    """
+    def _wrapped(name: str, original: Any):
+        def _invoke(args: dict[str, Any]):
+            telemetry["step_counter"] = int(telemetry.get("step_counter") or 0) + 1
+            step = telemetry["step_counter"]
+            result = original(args)
+            if name == "shell":
+                match = _SHELL_EXIT_RE.search(str(result))
+                telemetry.setdefault("tests", []).append(
+                    {
+                        "step": step,
+                        "command": str((args or {}).get("command", ""))[:300],
+                        "exit_code": int(match.group(1)) if match else None,
+                    }
+                )
+            else:
+                telemetry["last_write_step"] = step
+            return result
+        return _invoke
+
+    for name in ("shell", *WORKTREE_WRITE_TOOLS):
+        if name in sub_agent.dispatchers:
+            sub_agent.dispatchers[name] = _wrapped(name, sub_agent.dispatchers[name])
+
+
 def run_subagent(args: dict[str, Any], runtime: dict[str, Any] | None = None) -> str:
     """Execute an isolated SubAgent while enforcing the Single-SubAgent file lock."""
     from core.agent import Agent
+    from core import subagent_gate
 
     objective = str((args or {}).get("objective") or "").strip()
     if not objective:
@@ -229,6 +284,24 @@ def run_subagent(args: dict[str, Any], runtime: dict[str, Any] | None = None) ->
     parent_task_id = (runtime or {}).get("parent_task_id")
     main_tasks_root = persistence.TASKS_ROOT
 
+    # Phase 11C: fork a dedicated Git worktree so the main workspace stays
+    # physically pristine regardless of what the SubAgent does to files.
+    wt_path: Path | None = None
+    isolation_note = ""
+    if worktree_isolation_enabled():
+        try:
+            wt_path = subagent_gate.create_subagent_worktree(
+                sub_id, repo_root=worktree_repo_root()
+            )
+        except Exception as exc:
+            wt_path = None
+            isolation_note = (
+                "worktree isolation unavailable; running in the shared workspace "
+                f"(main workspace may be mutated): {exc}"
+            )
+
+    telemetry: dict[str, Any] = {"step_counter": 0, "last_write_step": None, "tests": []}
+
     try:
         sub_agent = Agent(
             config=sub_config,
@@ -255,6 +328,9 @@ def run_subagent(args: dict[str, Any], runtime: dict[str, Any] | None = None) ->
         sub_agent.tools = filtered_tools
         sub_agent.dispatchers = filtered_dispatchers
 
+        if wt_path is not None:
+            _install_telemetry_interception(sub_agent, telemetry)
+
         if runtime and runtime.get("subagent_client") is not None:
             sub_agent.client = runtime["subagent_client"]
         elif runtime and runtime.get("client") is not None and sub_config.profile_name == "default":
@@ -263,13 +339,31 @@ def run_subagent(args: dict[str, Any], runtime: dict[str, Any] | None = None) ->
         prompt_parts = [f"[SubAgent Objective]\n{objective}"]
         if context_hints:
             prompt_parts.append(f"[Context Hints]\n{context_hints}")
+        if wt_path is not None:
+            prompt_parts.append(
+                "[Isolation] Your workspace is the isolated Git worktree at "
+                f"{wt_path}. All file edits stay there until the parent reviews "
+                "your artifact delivery card."
+            )
+        if isolation_note:
+            prompt_parts.append(f"[Isolation Notice] {isolation_note}")
         prompt_parts.append(
             "Complete the objective using available tools and finish with TASK_DONE: <concise distilled summary> "
             "or TASK_BLOCKED: <reason>."
         )
         full_prompt = "\n\n".join(prompt_parts)
 
-        final_output = sub_agent.run_task(full_prompt, task_id=sub_id)
+        root_patcher = (
+            mock.patch.object(tools_mod, "ROOT", wt_path) if wt_path is not None else None
+        )
+        if root_patcher is not None:
+            root_patcher.start()
+        try:
+            final_output = sub_agent.run_task(full_prompt, task_id=sub_id)
+        finally:
+            if root_patcher is not None:
+                root_patcher.stop()
+
         was_aborted = bool(
             interrupt.is_step_rejected(sub_id, base_root=root)
             or (parent_task_id and interrupt.is_step_rejected(parent_task_id, base_root=main_tasks_root))
@@ -278,9 +372,31 @@ def run_subagent(args: dict[str, Any], runtime: dict[str, Any] | None = None) ->
         terminal_state = _map_subagent_terminal_status(final_output, was_aborted=was_aborted)
         persistence.atomic_write_text(sub_dir / persistence.STATUS_FILE, f"{terminal_state}\n")
 
+        artifact_card: dict[str, Any] | None = None
+        review_prompt = ""
+        if wt_path is not None:
+            try:
+                artifact_card = subagent_gate.generate_artifact_card(
+                    sub_id,
+                    wt_path,
+                    tests_executed=list(telemetry.get("tests") or []),
+                    summary=final_output,
+                    last_write_step=telemetry.get("last_write_step"),
+                    terminal_state=terminal_state,
+                    risk_assessment=str((args or {}).get("risk_assessment") or ""),
+                )
+                review_prompt = subagent_gate.format_adversarial_review_prompt(artifact_card)
+            except Exception as card_err:
+                artifact_card = {
+                    "subagent_id": sub_id,
+                    "error": f"artifact card generation failed: {card_err}",
+                }
+
     except Exception as exc:
         final_output = f"TASK_BLOCKED: SubAgent error: {exc}"
         terminal_state = "failed"
+        artifact_card = None
+        review_prompt = ""
         persistence.atomic_write_text(sub_dir / persistence.STATUS_FILE, "failed\n")
     finally:
         with _subagent_mutex:
@@ -296,10 +412,18 @@ def run_subagent(args: dict[str, Any], runtime: dict[str, Any] | None = None) ->
         distilled = distilled[:MAX_REPORT_CHARS] + "...[truncated]"
 
     audit_rel = f".agent/subagents/{sub_id}/checkpoint.jsonl"
-    result_payload = {
+    result_payload: dict[str, Any] = {
         "subagent_id": sub_id,
         "status": terminal_state,
         "audit_path": audit_rel,
         "report": distilled,
     }
+    if isolation_note:
+        result_payload["isolation_note"] = isolation_note
+    if artifact_card is not None:
+        result_payload["artifact_card_path"] = artifact_card.get("artifact_card_path", "")
+        result_payload["hazard_flags"] = artifact_card.get("hazard_flags", [])
+        result_payload["worktree_path"] = artifact_card.get("worktree_path", "")
+        if review_prompt:
+            result_payload["review_prompt"] = review_prompt
     return json.dumps(result_payload, ensure_ascii=False)

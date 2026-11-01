@@ -78,7 +78,11 @@ Qwen38-llama-cpp-harness-windows/
 │   ├── queue_manager.py        # 显式文件基双端同步队列 (.agent/queue/)
 │   ├── interrupt.py            # 三道实时打断门禁 (Gate 1-3) 与崩溃自愈
 │   ├── subagent_runner.py      # 单实例隔离 SubAgent 沙箱运行器
-│   ├── context.py              # 会话上下文生命周期与分支重组
+│   ├── subagent_gate.py        # SubAgent Git Worktree 隔离、产物卡片与风险门禁
+│   ├── skill_sandbox.py        # 动态技能 AST 纯度沙箱、干运行准入与三振隔离
+│   ├── macro_compiler.py       # 成功轨迹宏结晶编译器（0-Token 确定性重放）
+│   ├── token_grid.py           # DeltaNet 1024-Token 网格对齐与推理遥测自检
+│   ├── context.py              # 会话上下文生命周期、分支重组与尾端暂态 GC
 │   ├── config.py               # 三级角色路由、模型窗口探测与费用审计
 │   ├── tools.py                # 内置安全命令执行、文件读写与 CDP 通信
 │   ├── validator.py            # 参数 Schema 校验与死循环防护
@@ -86,16 +90,25 @@ Qwen38-llama-cpp-harness-windows/
 ├── skills/                     # 可扩展原子技能目录（万物皆 Skill）
 │   ├── shell.py                # PowerShell 7 安全执行
 │   ├── chrome_dom.py           # Chrome DevTools Protocol (CDP) 交互
+│   ├── grounding.py            # 双模语义-视觉对准定位（UIA 穿透 + 高清切片）
+│   ├── window_manager.py       # Win32 六步防死锁窗口激活状态机
 │   ├── screenshot.py           # 屏幕捕获与无损降级
 │   ├── subagent.py             # 派生隔离子智能体沙箱
+│   ├── subagent_review.py      # 父级对立证伪审查裁决（快进合并 / 一键回滚）
+│   ├── crystallize_macro.py    # 将成功工作流轨迹结晶为确定性宏技能
 │   └── ...                     # read_file, write_file, mouse, keyboard 等
 ├── web/                        # 零构建原生 ES Modules Web 控制台
 │   ├── index.html              # 控制台页面结构
 │   ├── styles.css              # 原生自适应样式
 │   ├── app.js                  # 核心控制器与 SSE 事件总线
+│   ├── store.js                # 响应式状态容器
 │   ├── tree_view.js            # DAG 分支树可视化投影
-│   └── queue_panel.js          # 队列操作面板
-├── tests/                      # 14 个自动化测试套件（107 项测试）
+│   ├── inspector.js            # 检查器与单步断点交互
+│   ├── fact_ledger.js          # 五段式事实账本实时投影
+│   ├── queue_panel.js          # 队列操作面板
+│   ├── canvas_overlay.js       # 双模对准 Canvas 透视叠加层
+│   └── dag_timeline.js         # 因果时序回溯与重放
+├── tests/                      # 28 个自动化测试套件（395 项测试）
 ├── .agent/                     # 运行时状态（仅 AGENTS.md 纳入版本控制）
 │   └── AGENTS.md               # 核心系统提示词与行为规则
 ├── docs/                       # 项目文档中心（SPEC, RFC, 任务卡片, 运维手册）
@@ -110,9 +123,20 @@ Qwen38-llama-cpp-harness-windows/
 
 ---
 
+## 🧠 Phase 11 认知自治能力
+
+在基础 ReAct 循环之上，运行时内建四层长程自治机制（均可通过磁盘文件审计）：
+
+- **尾端锚定上下文 GC**（`core/context.py`）：局部试错闭环成功后，紧邻尾部的失败回合块从内存投影中折叠为一条 `[Transient Attempt Pruned: ...]` 因果徽标；磁盘 `checkpoint.jsonl` 永不篡改，OpenAI tool_calls 拓扑 1:1 保真，TDD 门禁开启期间禁剪。
+- **DeltaNet 1024-Token 网格对齐**（`core/token_grid.py`）：静态骨架前缀（系统提示 + 事实账本）通过零语义 `\n---` 结构分隔线吸附至服务端检查点网格线；`/tokenize` 精确计数 + SHA-1 记忆化，离线平滑回退加权估算；`timings.cache_n` 遥测审计（RESONANT / COLD_RESET_DETECTED / CHECKPOINT_GAP_DRIFT）与确定性重播种熔断。
+- **SubAgent Git Worktree 沙箱门禁**（`core/subagent_gate.py` + `skills/subagent_review.py`）：子智能体在 `.agent/worktrees/<id>` 物理隔离工作树中执行；宿主（非 LLM）确定性生成防篡改产物卡片（文件清单 + SHA-256 + 统一 Diff + 测试回执 + 五类静态风险标记）；父智能体对立证伪审查后 `--ff-only` 快进合并或一键回滚并沉淀 `[Branch Rewind Lesson]`。
+- **工作流宏结晶**（`core/macro_compiler.py` + `skills/crystallize_macro.py`）：将成功 DAG 轨迹提纯（剔除失败重试与只读探针、合并 grounding+mouse 为语义 `uia_click`）、按目标污点抽取 `$slot` 参数、发射 AST 顶层零 Call 纯度的宏技能；界面改版时返回 `[MACRO_STALE_HANDOVER]` 断点热交接指令，0 Token 毫秒级确定性重放。
+
+---
+
 ## 🧪 测试与质量门禁
 
-运行全量测试套件（零外部服务依赖，测试全套件秒级完成）：
+运行全量测试套件（零外部服务依赖，测试全套件约 2.5 分钟完成）：
 
 ```bash
 py -3 -m unittest discover -s tests -t . -v

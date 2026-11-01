@@ -50,6 +50,7 @@ from core.persistence import (
     set_current_session,
 )
 from core import queue_manager
+from core import token_grid
 from core.tools import (
     discover_skills,
     load_text,
@@ -202,9 +203,14 @@ class Agent:
             base_system,
             max_screenshots=6,
             retain_screenshots=2,
+            base_url=self.config.base_url,
         )
         self.current_task_id: str | None = None
         self._active_step_id: str = ""
+        # Phase 11B telemetry state: one-shot cache reseed after drift, and a
+        # short post-rewind window where repetition loops trigger a reseed.
+        self._force_cache_reset = False
+        self._post_branch_switch_rounds = 0
 
     def _init_role_clients(self) -> None:
         """Initialize optional tiered compactor client when configured."""
@@ -498,6 +504,43 @@ class Agent:
         """
         return self.READ_TIMEOUT_BASE + self.context.token_estimate() / self.READ_TIMEOUT_TOKENS_PER_SECOND
 
+    def _audit_checkpoint_telemetry(self, resp: Any) -> None:
+        """Phase 11B: audit llama-server cache telemetry against the grid.
+
+        Cold resets and checkpoint-gap drift arm the deterministic one-shot
+        re-seed (next request rebuilds slot 0 from a clean prefill).
+        """
+        timings = getattr(resp, "timings", None)
+        if timings is None:
+            extra = getattr(resp, "model_extra", None)
+            if isinstance(extra, dict):
+                timings = extra.get("timings")
+        if not isinstance(timings, dict):
+            return
+        try:
+            report = token_grid.verify_deltanet_checkpoint_telemetry(
+                timings,
+                self.context.get_prefix_token_count(),
+            )
+        except Exception as exc:
+            self.logger.warning(f"[token-grid] telemetry audit failed: {exc}")
+            return
+        status = report.get("status")
+        if status in (None, "UNKNOWN"):
+            return
+        if status == "RESONANT":
+            self.logger.info(
+                f"[token-grid] cache_n={report['cache_n']} status=RESONANT "
+                f"prefix~{report['expected_prefix_tokens']} tokens"
+            )
+        else:
+            self.logger.warning(
+                f"[token-grid] cache_n={report['cache_n']} status={status} "
+                f"prefix~{report['expected_prefix_tokens']} "
+                f"min_expected={report['min_expected_cache']}"
+            )
+            self._force_cache_reset = True
+
     def chat(self, tool_choice: str = "auto"):
         # Dynamic generation cap: never exceed the remaining window space.
         gen_cap = min(
@@ -505,6 +548,16 @@ class Agent:
             self.config.n_ctx - self.context.token_estimate() - GEN_OVERHEAD_MARGIN,
         )
         gen_cap = max(gen_cap, 1024)  # floor so tiny payloads keep a usable budget
+        extra_body = dict(self.config.chat_extra or {})
+        if self._force_cache_reset:
+            # Phase 11B deterministic re-seeding: blank slot 0's dirty
+            # recurrent state once and rebuild the RAM checkpoint pool from a
+            # clean chunked-parallel prefill.
+            extra_body.update({"id_slot": 0, "cache_prompt": False})
+            self._force_cache_reset = False
+            self.logger.warning(
+                "[token-grid] forced clean re-seed on slot 0 (cache_prompt=False) for this request"
+            )
         kwargs = dict(
             model=self.config.model,
             messages=self.context.as_list(),
@@ -514,7 +567,7 @@ class Agent:
             top_p=0.95,
             max_tokens=gen_cap,
             stream=True,
-            extra_body=self.config.chat_extra,
+            extra_body=extra_body,
             timeout=self._adaptive_read_timeout(),
         )
         last_err: Exception | None = None
@@ -546,6 +599,7 @@ class Agent:
         printed = False
         reasoning_printed = False
         abort_detected: dict[str, Any] | None = None
+        timings: dict[str, Any] | None = None
         output_queue: queue.SimpleQueue = queue.SimpleQueue()
         stream_to_stdout = bool(getattr(self.observer, "stream_to_stdout", True))
 
@@ -590,6 +644,11 @@ class Agent:
                         break
 
                 if not chunk.choices:
+                    # llama-server emits the perf telemetry block as a final
+                    # choices-less chunk; harvest it for the token-grid audit.
+                    extra = getattr(chunk, "model_extra", None)
+                    if isinstance(extra, dict) and isinstance(extra.get("timings"), dict):
+                        timings = extra["timings"]
                     continue
                 choice = chunk.choices[0]
                 finish_reason = choice.finish_reason or finish_reason
@@ -663,7 +722,8 @@ class Agent:
             abort_info=abort_detected,
         )
         return SimpleNamespace(
-            choices=[SimpleNamespace(message=message, finish_reason=finish_reason)]
+            choices=[SimpleNamespace(message=message, finish_reason=finish_reason)],
+            timings=timings,
         )
 
     _LEDGER_INSTRUCTION = (
@@ -878,6 +938,9 @@ class Agent:
                     disk_branch = persistence.get_current_branch(self.current_task_id)
                     if disk_branch != self.context.branch:
                         self.context.reload_from_branch(disk_branch)
+                        # Phase 11B: arm the post-rewind re-seed sentinel — the
+                        # next two responses are audited for repetition loops.
+                        self._post_branch_switch_rounds = 2
 
             if self.context.token_estimate() > self.config.compact_trigger:
                 try:
@@ -941,6 +1004,18 @@ class Agent:
             raw_resp = self.chat(tool_choice=choice)
             resp = raw_resp if hasattr(raw_resp, "choices") else self.collect_stream(raw_resp)
             msg = resp.choices[0].message
+
+            # Phase 11B: DeltaNet checkpoint telemetry audit + post-rewind
+            # repetition sentinel (deterministic re-seeding on contamination).
+            self._audit_checkpoint_telemetry(resp)
+            if self._post_branch_switch_rounds > 0:
+                self._post_branch_switch_rounds -= 1
+                if token_grid.should_reseed_generation(msg.content or ""):
+                    self._force_cache_reset = True
+                    self.logger.warning(
+                        "[token-grid] post-branch-switch response shows a repetition loop; "
+                        "arming one-shot slot-0 cache reset"
+                    )
 
             reasoning = (getattr(msg, "reasoning_content", None) or "").strip()
             if reasoning and not getattr(msg, "reasoning_streamed", False):
@@ -1315,6 +1390,20 @@ class Agent:
                         active_tool=None,
                         base_root=self._tasks_root,
                     )
+
+                # Phase 11A: Tail-Anchored Ephemeral Error GC. The disk DAG
+                # stays immutable; only the in-memory projection folds resolved
+                # transient failures so the next request carries a clean tail.
+                try:
+                    tdd_open = bool(self._pending_tdd_write())
+                    gc_res = self.context.prune_resolved_trial_tail(tdd_gate_open=tdd_open)
+                    if gc_res.get("pruned"):
+                        self.logger.info(
+                            f"[context-gc] Pruned {gc_res['pruned_turns']} turn(s), "
+                            f"saved ~{gc_res['tokens_saved']} tokens: {gc_res['badge']}"
+                        )
+                except Exception as gc_err:
+                    self.logger.warning(f"[context-gc] Safe GC failed: {gc_err}")
 
                 # Unified Batch Repetition Check in Validator
                 batch_res = self.validator.check_batch_repetition(round_sigs)

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import os
 import unittest
 from unittest import mock
 
@@ -14,7 +15,17 @@ from skills import subagent as subagent_skill
 from tests.support import IsolatedCase, ScriptedLLM, build_agent
 
 
-class SubAgentIsolationTests(IsolatedCase):
+class IsolatedCaseNoWorktree(IsolatedCase):
+    """IsolatedCase with Git-worktree isolation disabled (no real repo forked)."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self._stack.enter_context(
+            mock.patch.dict(os.environ, {"SUBAGENT_WORKTREE": "0"})
+        )
+
+
+class SubAgentIsolationTests(IsolatedCaseNoWorktree):
     def test_subagent_isolates_intermediate_turns_and_returns_distilled_summary(self):
         sub_llm = ScriptedLLM([
             {"tool_calls": [{"id": "sub_call_1", "name": "list_dir", "arguments": '{"path": "."}'}]},
@@ -89,7 +100,7 @@ class SubAgentIsolationTests(IsolatedCase):
         self.assertFalse(subagent_runner.active_lock_path().exists())
 
 
-class SubAgentCrossSandboxTests(IsolatedCase):
+class SubAgentCrossSandboxTests(IsolatedCaseNoWorktree):
     def test_runtime_exposes_parent_task_id_without_overwrite(self):
         self.write_skill(
             "runtime_probe",
@@ -143,7 +154,7 @@ class SubAgentCrossSandboxTests(IsolatedCase):
         self.assertNotIn("parent_id", out)
 
 
-class SubAgentSlotRoutingTests(IsolatedCase):
+class SubAgentSlotRoutingTests(IsolatedCaseNoWorktree):
     class _FakeAgent:
         captured_config = None
 

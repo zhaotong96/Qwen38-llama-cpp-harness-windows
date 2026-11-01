@@ -38,10 +38,10 @@ DRY_RUN_TIMEOUT = 5.0
 
 FROZEN_CORE_SKILLS = frozenset({
     "add_skill", "branch_rewind", "chat_with_web_llm", "chrome_dom", "clipboard",
-    "git", "grounding", "keyboard", "list_dir", "modify_skill", "mouse", "patch",
-    "pic_zoom", "read_checkpoint_node", "read_file", "read_skill", "screenshot",
-    "search", "shell", "subagent", "task_blocked", "task_done", "ui_tree",
-    "window_manager", "write_file",
+    "crystallize_macro", "git", "grounding", "keyboard", "list_dir", "modify_skill",
+    "mouse", "patch", "pic_zoom", "read_checkpoint_node", "read_file", "read_skill",
+    "screenshot", "search", "shell", "subagent", "subagent_review", "task_blocked",
+    "task_done", "ui_tree", "window_manager", "write_file",
 })
 
 ALLOWED_EXTERNAL_PACKAGES = frozenset({"openai", "mss", "PIL", "websocket"})

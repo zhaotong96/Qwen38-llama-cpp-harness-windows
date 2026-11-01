@@ -1,0 +1,17 @@
+# Auto-detect text files and normalize line endings
+* text=auto
+
+# Python source files must use LF
+*.py text eol=lf
+
+# Markdown and text assets
+*.md text eol=lf
+*.json text eol=lf
+*.jsonl text eol=lf
+*.js text eol=lf
+*.html text eol=lf
+*.css text eol=lf
+
+# Windows batch scripts require CRLF
+*.bat text eol=crlf
+*.cmd text eol=crlf

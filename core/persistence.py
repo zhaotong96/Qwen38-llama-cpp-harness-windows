@@ -25,6 +25,7 @@ from pathlib import Path
 from typing import Any
 
 from core.models import ROOT
+from core.token_grid import GRID_STEP, estimate_text_tokens
 
 
 TASKS_ROOT = ROOT / ".agent" / "tasks"
@@ -556,6 +557,60 @@ def build_branch_context(
     return messages
 
 
+def _node_content_tokens(message: dict[str, Any]) -> int:
+    """Weighted token estimate covering text, multimodal parts, and tool payloads."""
+    total = 0
+    content = message.get("content")
+    if isinstance(content, str):
+        total += estimate_text_tokens(content)
+    elif isinstance(content, list):
+        for part in content:
+            if isinstance(part, dict) and part.get("type") == "image_url":
+                total += 1120
+            elif isinstance(part, dict):
+                total += estimate_text_tokens(str(part.get("text", "")))
+            elif part is not None:
+                total += estimate_text_tokens(str(part))
+    tool_calls = message.get("tool_calls")
+    if tool_calls:
+        total += estimate_text_tokens(json.dumps(tool_calls, ensure_ascii=False, default=str))
+    return total
+
+
+def _grid_alignment_meta(
+    existing_nodes: list[dict[str, Any]],
+    parent_id: str | None,
+    message: dict[str, Any],
+) -> dict[str, Any]:
+    """Track cumulative branch tokens and flag nodes crossing a checkpoint line.
+
+    A node is ``ckpt_aligned`` when the branch's cumulative token position
+    crosses a ``1024*K`` grid line exactly at a turn-closing node (a tool
+    receipt, a user turn, or a text-only assistant turn) — the states where a
+    fresh assistant turn may start, i.e. the points a rewind anchor can snap
+    to without orphaning tool receipts.
+    """
+    node_map = {n["id"]: n for n in existing_nodes}
+    prev_cum = 0
+    cursor = parent_id
+    visited: set[str] = set()
+    while cursor and cursor in node_map and cursor not in visited:
+        visited.add(cursor)
+        prev_cum += _node_content_tokens(node_map[cursor])
+        cursor = node_map[cursor].get("parent_id")
+
+    cum_tokens = prev_cum + _node_content_tokens(message)
+    meta: dict[str, Any] = {"cum_tokens": cum_tokens}
+    role = message.get("role")
+    turn_closing = role in ("tool", "user") or (
+        role == "assistant" and not message.get("tool_calls")
+    )
+    crossed = (cum_tokens // GRID_STEP) > (prev_cum // GRID_STEP)
+    if crossed and turn_closing:
+        meta["ckpt_aligned"] = True
+    return meta
+
+
 def append_dag_node(
     task_id: str,
     message: dict[str, Any],
@@ -581,13 +636,19 @@ def append_dag_node(
         resolved_parent = parent_id
 
     node_id = message.get("id") if ("id" in message and "parent_id" in message) else _generate_node_id(len(existing_nodes) + 1)
+
+    # Phase 11B: deterministic cumulative-token bookkeeping for rewind anchors.
+    grid_meta = _grid_alignment_meta(existing_nodes, resolved_parent, message)
+    merged_meta: dict[str, Any] = dict(meta) if isinstance(meta, dict) else {}
+    merged_meta.update(grid_meta)
+
     node = _wrap_message_as_node(
         message,
         node_id=node_id,
         parent_id=resolved_parent,
         branch=target_branch,
         node_type=node_type,
-        meta=meta,
+        meta=merged_meta or None,
     )
 
     with checkpoint.open("a", encoding="utf-8", newline="\n") as handle:
