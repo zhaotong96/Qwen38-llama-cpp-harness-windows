@@ -11,6 +11,11 @@ from core.models import ROOT
 
 
 def setup_logger(name: str = "agent", log_level: str = "INFO") -> logging.Logger:
+    if hasattr(sys.stdout, "reconfigure"):
+        try:
+            sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+        except Exception:
+            pass
     logger = logging.getLogger(name)
     logger.setLevel(getattr(logging, log_level.upper(), logging.INFO))
 

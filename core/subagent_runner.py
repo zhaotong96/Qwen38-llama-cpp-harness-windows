@@ -24,12 +24,25 @@ from core import tools as tools_mod
 
 ACTIVE_LOCK_FILE = "active.lock"
 EXCLUDED_META_SKILLS = frozenset(
-    {"subagent", "add_skill", "modify_skill", "branch_rewind", "subagent_review", "crystallize_macro"}
+    {"subagent", "add_skill", "modify_skill", "branch_rewind", "subagent_review", "crystallize_macro", "subagent_relay"}
 )
 MAX_REPORT_CHARS = 2000
 WORKTREE_WRITE_TOOLS = ("write_file", "patch", "modify_skill", "add_skill")
 _SHELL_EXIT_RE = re.compile(r"(?m)^exit=(\d+)\s*$")
 _subagent_mutex = threading.Lock()
+
+# --- Phase 12C: three-role relay pipeline (Scout → Builder → Verifier) ---
+ROLE_MODES = ("general", "scout", "builder", "verifier")
+SCOUT_TOOL_WHITELIST = frozenset(
+    {"read_file", "list_dir", "search", "screenshot", "ui_tree", "read_skill", "grounding", "task_done", "task_blocked"}
+)
+VERIFIER_TOOL_WHITELIST = frozenset({"shell", "read_file", "task_done", "task_blocked"})
+SCOUT_VIOLATION_MESSAGE = "error: [SECURITY_VIOLATION] Scout role is strictly read-only"
+VERIFIER_VIOLATION_MESSAGE = (
+    "error: [SECURITY_VIOLATION] Verifier shell is limited to read-only unittest/pytest runs"
+)
+_VERIFIER_TEST_CMD_RE = re.compile(r"(?i)\bunittest\b|\bpytest\b")
+_UNITTEST_COUNT_RE = re.compile(r"(?m)^Ran (\d+) tests?")
 
 
 def worktree_isolation_enabled() -> bool:
@@ -217,7 +230,28 @@ def _install_telemetry_interception(sub_agent: Any, telemetry: dict[str, Any]) -
             sub_agent.dispatchers[name] = _wrapped(name, sub_agent.dispatchers[name])
 
 
-def run_subagent(args: dict[str, Any], runtime: dict[str, Any] | None = None) -> str:
+def run_subagent(args_or_task_id: Any, prompt_or_runtime: Any = None, role_mode: str = "general", timeout: float = 300.0, **kwargs: Any):
+    """Dual-contract SubAgent entry point (Phase 12C).
+
+    - ``run_subagent(args_dict, runtime_dict) -> str``: the original skill
+      form (single general-purpose SubAgent).
+    - ``run_subagent(task_id, prompt, role_mode="general", timeout=300.0) -> dict``:
+      the Phase 12C relay form with role-scoped sandboxing; ``role_mode`` is
+      one of ``general`` (compatibility), ``scout``, ``builder`` or
+      ``verifier``.
+    """
+    if isinstance(args_or_task_id, dict):
+        return _run_subagent_legacy(args_or_task_id, prompt_or_runtime)
+    return run_relay_subagent(
+        str(args_or_task_id),
+        str(prompt_or_runtime or ""),
+        role_mode=role_mode,
+        timeout=timeout,
+        **kwargs,
+    )
+
+
+def _run_subagent_legacy(args: dict[str, Any], runtime: dict[str, Any] | None = None) -> str:
     """Execute an isolated SubAgent while enforcing the Single-SubAgent file lock."""
     from core.agent import Agent
     from core import subagent_gate
@@ -427,3 +461,421 @@ def run_subagent(args: dict[str, Any], runtime: dict[str, Any] | None = None) ->
         if review_prompt:
             result_payload["review_prompt"] = review_prompt
     return json.dumps(result_payload, ensure_ascii=False)
+
+
+# ---------------------------------------------------------------------------
+# Phase 12C: three-role relay pipeline (Scout → Builder → Verifier)
+# ---------------------------------------------------------------------------
+
+def _denying_dispatcher(tool_name: str, message: str, violations: list) -> Any:
+    """Host-side interception stub for role-forbidden tools (tamper-proof)."""
+    def _denied(args):
+        violations.append({"tool": tool_name, "args": args, "message": message})
+        return message
+    return _denied
+
+
+def _install_role_guards(
+    sub_agent: Any,
+    role_mode: str,
+    violations: list,
+    test_execution: dict[str, Any],
+) -> None:
+    """Enforce the role permission matrix at the dispatcher boundary.
+
+    Scout: every write-capable tool is replaced by a security-violation stub.
+    Verifier: shell is narrowed to read-only unittest/pytest runs whose exit
+    codes are captured host-side; everything else is denied.
+    """
+    if role_mode == "scout":
+        whitelist = SCOUT_TOOL_WHITELIST
+    elif role_mode == "verifier":
+        whitelist = VERIFIER_TOOL_WHITELIST
+    else:
+        return
+    message = SCOUT_VIOLATION_MESSAGE if role_mode == "scout" else VERIFIER_VIOLATION_MESSAGE
+    # Cover both the surviving dispatchers and the meta-skills that the
+    # general filter already dropped: any write attempt must be intercepted
+    # with an explicit security violation, never with "unknown tool".
+    for name in set(sub_agent.dispatchers.keys()) | EXCLUDED_META_SKILLS:
+        if name in whitelist:
+            continue
+        sub_agent.dispatchers[name] = _denying_dispatcher(name, message, violations)
+
+    if role_mode == "verifier" and "shell" in sub_agent.dispatchers:
+        original_shell = sub_agent.dispatchers["shell"]
+
+        def _verifier_shell(args):
+            command = str((args or {}).get("command") or "")
+            if not _VERIFIER_TEST_CMD_RE.search(command):
+                violations.append({"tool": "shell", "args": args, "reason": "non-test command"})
+                return VERIFIER_VIOLATION_MESSAGE
+            result = original_shell(args)
+            exit_match = _SHELL_EXIT_RE.search(str(result))
+            count_match = _UNITTEST_COUNT_RE.search(str(result))
+            test_execution.update(
+                {
+                    "command": command[:300],
+                    "exit_code": int(exit_match.group(1)) if exit_match else 1,
+                    "tests_run": int(count_match.group(1)) if count_match else None,
+                }
+            )
+            return result
+
+        sub_agent.dispatchers["shell"] = _verifier_shell
+
+
+def _relay_branch_nodes(sub_id: str, root: Path) -> list[dict[str, Any]]:
+    with mock.patch.object(persistence, "TASKS_ROOT", root):
+        return persistence.build_branch_nodes(sub_id, "main")
+
+
+def _relay_anchor(sub_id: str, root: Path) -> tuple[str, bool]:
+    """Snap the relay anchor to the last 1024-aligned node, else the head."""
+    chain = _relay_branch_nodes(sub_id, root)
+    if not chain:
+        return "", False
+    for node in reversed(chain):
+        if (node.get("meta") or {}).get("ckpt_aligned"):
+            return str(node["id"]), True
+    return str(chain[-1]["id"]), False
+
+
+_SCOUT_PROBE_TOOLS = frozenset({"read_file", "list_dir", "search", "ui_tree", "grounding"})
+
+
+def _extract_scout_affected_files(sub_id: str, root: Path) -> list[str]:
+    """Deterministically collect the paths the scout probed, host-side."""
+    affected: list[str] = []
+    for node in _relay_branch_nodes(sub_id, root):
+        for tc in node.get("tool_calls") or []:
+            if not isinstance(tc, dict):
+                continue
+            function = tc.get("function") or {}
+            if str(function.get("name") or "") not in _SCOUT_PROBE_TOOLS:
+                continue
+            try:
+                args = json.loads(function.get("arguments") or "{}")
+            except Exception:
+                continue
+            for key in ("path", "target", "query", "pattern"):
+                value = str((args or {}).get(key) or "").strip()
+                if value and value not in affected:
+                    affected.append(value)
+            if len(affected) >= 20:
+                return affected
+    return affected
+
+
+def _write_scout_brief(
+    sub_id: str,
+    root: Path,
+    objective: str,
+    report: str,
+    affected_files: list[str],
+    anchor_node_id: str,
+    anchor_aligned: bool,
+) -> dict[str, Any]:
+    brief = {
+        "subagent_id": sub_id,
+        "objective": str(objective)[:2000],
+        "report": str(report)[:6000],
+        "affected_files": affected_files,
+        "anchor_node_id": anchor_node_id,
+        "anchor_ckpt_aligned": anchor_aligned,
+        "generated_at": datetime.now().isoformat(timespec="microseconds"),
+    }
+    persistence.atomic_write_text(
+        root / sub_id / "scout_brief.json",
+        json.dumps(brief, ensure_ascii=False, indent=2) + "\n",
+    )
+    return brief
+
+
+def _relay_worktree_path(worktree: Path) -> str:
+    try:
+        return f".agent/worktrees/{Path(worktree).name}"
+    except Exception:
+        return str(worktree)
+
+
+def run_relay_subagent(
+    task_id: str,
+    prompt: str,
+    role_mode: str = "general",
+    timeout: float = 300.0,
+    builder_worktree: str | None = None,
+    inherited_context: dict[str, Any] | None = None,
+    runtime: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Execute one relay stage under its role sandbox (single-flight enforced).
+
+    - ``scout``: strictly read-only in the main workspace; emits
+      ``scout_brief.json`` with a 1024-grid-aligned anchor node.
+    - ``builder``: mandatory ``.agent/worktrees/<id>`` isolation; ROOT and
+      file tools are locked to the sandbox.
+    - ``verifier``: mounts the builder's worktree read-only, runs the targeted
+      tests, and the host deterministically issues the verification ticket.
+    - ``general``: behaves like the legacy single SubAgent (returns dict).
+    """
+    from core.agent import Agent
+    from core import subagent_gate
+
+    role_mode = str(role_mode or "general").strip().lower()
+    if role_mode not in ROLE_MODES:
+        return {
+            "ok": False,
+            "error": f"invalid role_mode {role_mode!r} (expected one of {', '.join(ROLE_MODES)})",
+        }
+    prompt = str(prompt or "").strip()
+    if not prompt:
+        return {"ok": False, "error": "relay subagent requires a non-empty prompt"}
+
+    root = subagents_root()
+    root.mkdir(parents=True, exist_ok=True)
+    lock_file = active_lock_path()
+    sub_id = ""
+
+    active_id = get_active_subagent()
+    if active_id is not None:
+        return {
+            "ok": False,
+            "error": (
+                f"SUBAGENT_BUSY: SubAgent '{active_id}' is currently active. "
+                "Maintain single-SubAgent execution; wait until it reaches completed, failed, or cancelled."
+            ),
+        }
+
+    try:
+        sub_config = config_mod.load_config(role="subagent")
+    except Exception as exc:
+        return {"ok": False, "error": f"SUBAGENT_CONFIG: unable to resolve the subagent endpoint: {exc}"}
+
+    with _subagent_mutex:
+        active_id = get_active_subagent()
+        if active_id is not None:
+            return {
+                "ok": False,
+                "error": (
+                    f"SUBAGENT_BUSY: SubAgent '{active_id}' is currently active. "
+                    "Maintain single-SubAgent execution; wait until it reaches completed, failed, or cancelled."
+                ),
+            }
+        sub_id = f"sub_relay_{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}"
+        sub_dir = root / sub_id
+        sub_dir.mkdir(parents=True, exist_ok=True)
+        persistence.atomic_write_text(lock_file, f"{sub_id}\n")
+        persistence.atomic_write_text(sub_dir / persistence.STATUS_FILE, "running\n")
+
+    parent_task_id = str(task_id or "").strip() or None
+    main_tasks_root = persistence.TASKS_ROOT
+
+    wt_path: Path | None = None
+    violations: list = []
+    test_execution: dict[str, Any] = {}
+    result: dict[str, Any] = {"ok": True, "subagent_id": sub_id, "role_mode": role_mode}
+    try:
+        # Role worktree policy. Builder isolation is mandatory (no fallback).
+        if role_mode == "builder":
+            wt_path = subagent_gate.create_subagent_worktree(sub_id, repo_root=worktree_repo_root())
+        elif role_mode == "verifier":
+            if not builder_worktree:
+                raise RuntimeError("verifier role requires the builder_worktree to mount")
+            candidate = Path(builder_worktree)
+            if not candidate.is_absolute():
+                for base in (worktree_repo_root(), Path.cwd()):
+                    resolved = base / candidate
+                    if resolved.is_dir():
+                        candidate = resolved
+                        break
+            if not candidate.is_dir():
+                raise RuntimeError(f"builder worktree does not exist: {builder_worktree}")
+            wt_path = candidate
+            result["builder_subagent_id"] = candidate.name
+
+        client_stub = (runtime or {}).get("subagent_client")
+        if client_stub is not None:
+            # Injected clients must also cover Agent.__init__, which builds
+            # its own OpenAI client before the runtime swap below.
+            from core import agent as agent_module
+
+            with mock.patch.object(agent_module, "OpenAI", lambda *a, **k: client_stub):
+                sub_agent = Agent(
+                    config=sub_config,
+                    goal_mode=False,
+                    role="subagent",
+                    tasks_root_override=root,
+                    parent_task_id=parent_task_id,
+                    parent_tasks_root=main_tasks_root,
+                    stream_to_stdout=False,
+                )
+            sub_agent.client = client_stub
+        else:
+            sub_agent = Agent(
+                config=sub_config,
+                goal_mode=False,
+                role="subagent",
+                tasks_root_override=root,
+                parent_task_id=parent_task_id,
+                parent_tasks_root=main_tasks_root,
+                stream_to_stdout=False,
+            )
+
+        filtered_tools = []
+        filtered_dispatchers = {}
+        for tool in sub_agent.tools:
+            tname = tool["function"]["name"]
+            if tname in EXCLUDED_META_SKILLS:
+                continue
+            filtered_tools.append(tool)
+            if tname in sub_agent.dispatchers:
+                filtered_dispatchers[tname] = sub_agent.dispatchers[tname]
+        sub_agent.tools = filtered_tools
+        sub_agent.dispatchers = filtered_dispatchers
+
+        _install_role_guards(sub_agent, role_mode, violations, test_execution)
+
+        prompt_parts = [f"[Relay Role: {role_mode.upper()}]\n{prompt}"]
+        if role_mode == "scout":
+            prompt_parts.append(
+                "[Role Constraints] You are a strictly read-only scout. Analyze the code "
+                "topology and affected files; never modify anything. Finish with a "
+                "structured investigation report and TASK_DONE."
+            )
+        elif role_mode == "builder":
+            prompt_parts.append(
+                f"[Isolation] Your workspace is the isolated Git worktree at {wt_path}. "
+                "All file edits stay there until the verifier signs the delivery. "
+                "Finish with TASK_DONE once the change is complete and self-tested."
+            )
+        elif role_mode == "verifier":
+            prompt_parts.append(
+                f"[Verification Target] Mount the builder delivery read-only at {wt_path}. "
+                "Run the targeted unittest/pytest suite and static scans; never modify "
+                "anything. Finish with TASK_DONE and the exact test outcome."
+            )
+        if isinstance(inherited_context, dict) and inherited_context.get("anchor_node_id"):
+            prompt_parts.append(
+                "[Inherited Scout Anchor] Continue from the scout's aligned context "
+                f"anchor node '{inherited_context.get('anchor_node_id')}' (ckpt_aligned="
+                f"{bool(inherited_context.get('anchor_ckpt_aligned'))}) so the slot-0 "
+                "prefix cache is reused without a cold re-prefill."
+            )
+            if inherited_context.get("report"):
+                prompt_parts.append(f"[Scout Findings]\n{inherited_context['report']}")
+        full_prompt = "\n\n".join(prompt_parts)
+
+        root_patcher = (
+            mock.patch.object(tools_mod, "ROOT", wt_path) if wt_path is not None else None
+        )
+        if root_patcher is not None:
+            root_patcher.start()
+        run_error: Exception | None = None
+        try:
+            final_output = sub_agent.run_task(full_prompt, task_id=sub_id)
+        except Exception as exc:
+            run_error = exc
+            final_output = f"TASK_BLOCKED: relay role error: {exc}"
+        finally:
+            if root_patcher is not None:
+                root_patcher.stop()
+
+        was_aborted = bool(
+            interrupt.is_step_rejected(sub_id, base_root=root)
+            or (parent_task_id and interrupt.is_step_rejected(parent_task_id, base_root=main_tasks_root))
+            or sub_agent.last_aborted
+        )
+        terminal_state = (
+            "failed" if run_error is not None else _map_subagent_terminal_status(final_output, was_aborted=was_aborted)
+        )
+        persistence.atomic_write_text(sub_dir / persistence.STATUS_FILE, f"{terminal_state}\n")
+
+        distilled = (final_output or "").strip()
+        if len(distilled) > MAX_REPORT_CHARS:
+            distilled = distilled[:MAX_REPORT_CHARS] + "...[truncated]"
+        result.update(
+            {
+                "status": terminal_state,
+                "report": distilled,
+                "audit_path": f".agent/subagents/{sub_id}/checkpoint.jsonl",
+            }
+        )
+        if wt_path is not None:
+            result["worktree_path"] = _relay_worktree_path(wt_path)
+        if violations:
+            result["security_violations"] = violations
+
+        if role_mode == "scout":
+            anchor_node_id, anchor_aligned = _relay_anchor(sub_id, root)
+            affected = _extract_scout_affected_files(sub_id, root)
+            brief = _write_scout_brief(
+                sub_id, root, prompt, final_output, affected, anchor_node_id, anchor_aligned
+            )
+            result["scout_brief_path"] = f".agent/subagents/{sub_id}/scout_brief.json"
+            result["anchor_node_id"] = anchor_node_id
+            result["anchor_ckpt_aligned"] = anchor_aligned
+            result["scout_brief"] = brief
+
+        if role_mode == "verifier":
+            owner_id = wt_path.name
+            tests_executed = [dict(test_execution)] if test_execution else []
+            card = subagent_gate.generate_artifact_card(
+                owner_id,
+                wt_path,
+                tests_executed=tests_executed,
+                summary=final_output,
+                terminal_state=terminal_state,
+            )
+            anchor = ""
+            if isinstance(inherited_context, dict):
+                anchor = str(inherited_context.get("anchor_node_id") or "")
+            ticket = subagent_gate.generate_verification_ticket(
+                owner_id,
+                card.get("git_diff_patch") or "",
+                dict(test_execution),
+                card.get("hazard_flags") or [],
+                builder_worktree=_relay_worktree_path(wt_path),
+                scout_anchor_node=anchor,
+            )
+            result["builder_subagent_id"] = owner_id
+            result["verification_ticket"] = ticket
+            result["hazard_flags"] = card.get("hazard_flags") or []
+            result["test_execution"] = dict(test_execution)
+            result["artifact_card_path"] = card.get("artifact_card_path", "")
+
+        if run_error is not None and role_mode in ("builder", "verifier") and wt_path is not None:
+            # Crash cleanup: destroy the partial sandbox, never leak residue.
+            try:
+                subagent_gate.finalize_subagent_worktree(
+                    wt_path.name,
+                    "revert",
+                    f"relay stage crashed: {run_error}",
+                    repo_root=worktree_repo_root(),
+                )
+                result["worktree_cleaned"] = True
+            except Exception as cleanup_err:
+                result["worktree_cleaned"] = False
+                result["cleanup_error"] = str(cleanup_err)
+        return result
+
+    except Exception as exc:
+        try:
+            persistence.atomic_write_text(sub_dir / persistence.STATUS_FILE, "failed\n")
+        except Exception:
+            pass
+        if wt_path is not None and role_mode == "builder":
+            try:
+                subagent_gate.finalize_subagent_worktree(
+                    wt_path.name, "revert", f"relay stage crashed: {exc}", repo_root=worktree_repo_root()
+                )
+            except Exception:
+                pass
+        return {"ok": False, "subagent_id": sub_id, "role_mode": role_mode, "status": "failed", "error": str(exc)}
+    finally:
+        with _subagent_mutex:
+            if sub_id and lock_file.is_file():
+                try:
+                    if lock_file.read_text(encoding="utf-8").strip() == sub_id:
+                        lock_file.unlink(missing_ok=True)
+                except OSError:
+                    pass

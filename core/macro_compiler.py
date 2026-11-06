@@ -22,6 +22,7 @@ from the exact failed step instead of restarting the whole workflow.
 """
 from __future__ import annotations
 
+import ast
 import json
 import re
 from typing import Any
@@ -112,6 +113,72 @@ def _is_mouse_click(args: dict[str, Any]) -> bool:
     return str(args.get("action") or "").strip().lower() in ("click", "dblclick")
 
 
+def _receipt_blocks_replay(receipt: str) -> bool:
+    """True when a receipt marks its turn as non-replayable.
+
+    Beyond hard failures, a stale-macro handover receipt is a *failed* replay:
+    the healed spine must contain only the takeover primitives, never the
+    stale macro invocation itself.
+    """
+    if ContextManager._is_failed_tool_receipt(receipt):
+        return True
+    return "MACRO_STALE_AT_STEP" in receipt or "[MACRO_STALE_HANDOVER]" in receipt
+
+
+def _extract_unrolled_stale_macro_prefix(
+    macro_name: str, completed_count: int, failed_target: str = ""
+) -> list[dict[str, Any]]:
+    """Unroll completed prefix atomic steps from an existing macro skill module."""
+    if completed_count <= 0 or not macro_name:
+        return []
+    skill_file = persistence.TASKS_ROOT.parent / "skills" / f"{macro_name}.py"
+    if not skill_file.is_file():
+        from core.models import ROOT
+        skill_file = ROOT / "skills" / f"{macro_name}.py"
+    if not skill_file.is_file():
+        return []
+
+    try:
+        source = skill_file.read_text(encoding="utf-8")
+        parsed = ast.parse(source)
+    except Exception:
+        return []
+
+    default_args: dict[str, Any] = {}
+    raw_steps: list[Any] = []
+    for node in parsed.body:
+        if isinstance(node, ast.Assign):
+            for target in node.targets:
+                if isinstance(target, ast.Name) and target.id == "DEFAULT_ARGS":
+                    try:
+                        val = ast.literal_eval(node.value)
+                        if isinstance(val, dict):
+                            default_args = val
+                    except Exception:
+                        pass
+                elif isinstance(target, ast.Name) and target.id == "MACRO_STEPS":
+                    try:
+                        val = ast.literal_eval(node.value)
+                        if isinstance(val, (list, tuple)):
+                            raw_steps = list(val[:completed_count])
+                    except Exception:
+                        pass
+
+    unrolled: list[dict[str, Any]] = []
+    for step in raw_steps:
+        if isinstance(step, dict) and "op" in step and step["op"] != macro_name:
+            raw_args = step.get("args") or {}
+            step_target = str(raw_args.get("target") or step.get("intent") or "")
+            if failed_target and step_target == failed_target:
+                break
+            hydrated_args = {
+                k: (default_args.get(v.split(":", 1)[1], v) if isinstance(v, str) and v.startswith("$slot:") else v)
+                for k, v in raw_args.items()
+            }
+            unrolled.append({"op": step["op"], "args": hydrated_args})
+    return unrolled
+
+
 def extract_winning_spine(task_id: str, branch: str = "main") -> list[dict[str, Any]]:
     """Distill the winning branch into a spatially invariant action spine.
 
@@ -120,6 +187,10 @@ def extract_winning_spine(task_id: str, branch: str = "main") -> list[dict[str, 
     ``uia_click`` semantic action. Raw absolute-pixel mouse steps are dropped
     (Gate 2: no hardcoded screen coordinates in crystallized macros); mouse
     steps carrying a ``control_id`` are kept.
+
+    When a prior macro suffered a stale-handover, the completed prefix steps [0..k-1]
+    are statically unrolled from the old macro and prepended to the takeover spine,
+    solving the Prefix Amnesia Paradox without self-referential macro recursion.
     """
     chain = persistence.build_branch_nodes(task_id, branch)
     receipts: dict[str, str] = {
@@ -127,6 +198,30 @@ def extract_winning_spine(task_id: str, branch: str = "main") -> list[dict[str, 
         for node in chain
         if node.get("role") == "tool"
     }
+
+    # Extract any unrolled prefix steps from stale handover receipts
+    prefix_steps: list[dict[str, Any]] = []
+    for node in chain:
+        if node.get("role") != "assistant" or not node.get("tool_calls"):
+            continue
+        calls = _parse_tool_calls(node)
+        for call in calls:
+            receipt = receipts.get(call["id"], "")
+            if "[MACRO_STALE_HANDOVER]" in receipt or "MACRO_STALE_AT_STEP" in receipt:
+                try:
+                    data = json.loads(receipt)
+                    m_name = data.get("macro_name") or call.get("name")
+                    c_count = int(data.get("completed_steps_count", 0))
+                    failed_target = str(data.get("failed_target") or "")
+                    if m_name and c_count > 0:
+                        prefix_steps = _extract_unrolled_stale_macro_prefix(
+                            m_name, c_count, failed_target=failed_target
+                        )
+                        break
+                except Exception:
+                    pass
+        if prefix_steps:
+            break
 
     actions: list[dict[str, Any]] = []
     for node in chain:
@@ -139,7 +234,7 @@ def extract_winning_spine(task_id: str, branch: str = "main") -> list[dict[str, 
         healthy = True
         for call in calls:
             receipt = receipts.get(call["id"])
-            if receipt is None or ContextManager._is_failed_tool_receipt(receipt):
+            if receipt is None or _receipt_blocks_replay(receipt):
                 healthy = False
                 break
         if not healthy:
@@ -149,7 +244,7 @@ def extract_winning_spine(task_id: str, branch: str = "main") -> list[dict[str, 
         for call in calls:
             actions.append(call)
 
-    spine: list[dict[str, Any]] = []
+    spine: list[dict[str, Any]] = list(prefix_steps)
     index = 0
     while index < len(actions):
         action = actions[index]
@@ -385,6 +480,17 @@ def run(args, runtime=None):
             completed.append(index)
             continue
         bound_args = _bind_param(step.get("args") or {{}}, args)
+        if completed:
+            progress_note = "Steps 0..%d already executed on screen." % (len(completed) - 1)
+        else:
+            progress_note = "No steps executed yet on screen."
+        stale_directive = (
+            "[MACRO_STALE_HANDOVER] %s Step %d ('%s') failed due to UI change. "
+            "Please take over from Step %d."
+        ) % (progress_note, index, str(step.get("intent", "")), index)
+        failed_target = ""
+        if isinstance(bound_args, dict):
+            failed_target = str(bound_args.get("target") or step.get("intent") or "")
         return json.dumps(
             {{
                 "ok": False,
@@ -392,7 +498,12 @@ def run(args, runtime=None):
                 "macro_name": MACRO_NAME,
                 "completed_steps_count": len(completed),
                 "failed_step_index": index,
+                "failed_step_op": str(step.get("op") or ""),
+                "failed_target": failed_target,
+                "window_title": str(DEFAULT_ARGS.get("window_title") or ""),
+                "error_snapshot": str(outcome.get("error") or "")[:300],
                 "failed_step_spec": {{"op": step.get("op"), "args": bound_args}},
+                "directive": stale_directive,
                 "recovery_directive": (
                     "[MACRO_STALE_HANDOVER] Steps 1..{{completed}} succeeded on screen. "
                     "Do NOT restart from Step 1. Resume interactively from Step {{index}} "

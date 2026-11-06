@@ -41,24 +41,36 @@
 main.py          薄前端 1：CLI（一次性任务 / 交互 Shell / --resume）
 core/
   api.py         薄前端 2：HTTP JSON API（启动：py -3 -m core.api）
-  agent.py       Agent：ReAct 循环、skill 注册与分发、task/checkpoint 生命周期
+  agent.py       Agent：ReAct 循环、skill 注册与分发、task/checkpoint 生命周期、
+                 12A 常驻守护循环 run_daemon（事件总线单飞调度）、12B 端点自愈与
+                 Slot 快照挂载、12D 宏三振记分与自主重结晶收尾钩子
   config.py      load_config()：唯一配置装配入口（探测模型窗口并推导预算）
   models.py      路径与常量（ROOT、.agent/、logs/）+ 端点环境变量
   tools.py       内置工具实现 + skill 发现（discover_skills）
   context.py     会话消息、token 估算、截图裁剪、上下文压缩、尾端暂态 GC
-  token_grid.py  /tokenize 精确计数缓存、1024-Token 骨架网格对齐、缓存遥测审计
+  token_grid.py  /tokenize 精确计数缓存（12A 起为 4096 条有界 LRU）、
+                 1024-Token 骨架网格对齐、缓存遥测审计
+  event_bus.py   12A 事件驱动文件总线（.agent/inbox/ 信封、优先级全序、防抖、
+                 processed 归档与守护进程单飞 O_EXCL 锁）
+  slot_sidecar.py    12B 推理端点 Slot 0 隐状态 Sidecar（save/restore/健康探针）
+  saga_compensator.py 12B 四级可逆性 Saga 代数（分级、动作日志、机械补偿回滚）
   validator.py   参数校验（schema）与死循环防护（repetition guard）
   persistence.py .agent/tasks/<id>/{checkpoint.jsonl,status} 读写 + list_tasks
   interrupt.py   三道打断门禁（abort.flag / step_state / 输出忽略）与崩溃自愈
   queue_manager.py 显式文件基双端同步队列（.agent/queue/）
-  subagent_runner.py 单实例 SubAgent 沙箱运行器（active.lock 互斥）
-  subagent_gate.py   SubAgent Git Worktree 隔离、防篡改产物卡片与风险门禁
-  skill_sandbox.py   动态技能 AST 纯度沙箱、schema 校验、干运行准入与三振隔离
-  macro_compiler.py  成功轨迹宏结晶编译器（污点槽位 + AST 纯度代码发射）
+  subagent_runner.py SubAgent 沙箱运行器（active.lock 互斥；12C 三阶角色调度
+                     scout/builder/verifier 权限矩阵）
+  subagent_gate.py   SubAgent Git Worktree 隔离、防篡改产物卡片、风险门禁、
+                     12C 验证签章 ticket 与接力终裁
+  skill_sandbox.py   动态技能 AST 纯度沙箱、schema 校验、干运行准入、三振隔离
+                     与 12D 宏健康度三振账本
+  macro_compiler.py  成功轨迹宏结晶编译器（污点槽位 + AST 纯度代码发射、
+                     截尾上下文回执）
   logger.py      控制台与文件日志输出
-skills/*.py      能力文件（见 §4；含 subagent_review 审查裁决、crystallize_macro 宏结晶）
+skills/*.py      能力文件（见 §4；含 subagent_review 审查裁决、crystallize_macro
+                 宏结晶、subagent_relay 三阶接力流水线）
 tests/           单元/集成测试（见 §11）
-.agent/          运行时状态（见 §5）：AGENTS.md、GOAL.md、tasks/、inbox/
+.agent/          运行时状态（见 §5）：AGENTS.md、GOAL.md、tasks/、inbox/、slots/
 logs/            agent.log（运行日志）、safety_guard.log（安全拦截记录）
 README.md        使用说明；requirements.txt 依赖；pytest.ini 测试配置；.gitignore 忽略规则
 ```
@@ -115,13 +127,19 @@ def run(args: dict, runtime: dict) -> str   # 方式二：需要运行时上下�
 | --- | --- | --- | --- |
 | `.agent/tasks/<task_id>/status` | 单行词：`running` `done` `blocked` `finished` | `core.persistence.save_status`（由 `Agent.run_task/resume_task`、API 提交时调用） | 任务生命周期标记。`done`=最终答复含 TASK_DONE；`blocked`=含 TASK_BLOCKED 或执行异常；`finished`=循环正常结束但未显式标记；`unknown`=旧任务无该文件 |
 | `.agent/tasks/<task_id>/checkpoint.jsonl` | 每行一条 OpenAI 消息 JSON（首行可选 `{"_meta": ...}`） | `save_checkpoint`（任务结束时整份落盘） | 会话快照，`--resume` / `POST /tasks/<id>/resume` 的唯一事实来源 |
+| `.agent/tasks/<task_id>/action_journal.jsonl` | 每行一条 Saga 动作日志 JSON（等级、参数、前置快照） | `core.saga_compensator.record_action_journal`（12B） | 只追加不可变的可逆性账本；`execute_saga_rollback` 逆序机械补偿 Level 2，遇 Level 3 产出确认工单 |
+| `.agent/inbox/<ts>_<p>_<id>.json` | 12A 事件信封：`{event_id, priority, event_type, source, created_at, debounce_key, payload}` | `core.event_bus.emit_event`（Win32 钩子 / Watchdog / Cron / Web 均写此处） | 事件驱动总线；守护进程按优先级全序出队，消费后移入 `.agent/inbox/processed/` 归档。与旧版 `{"message": ...}` 操作员便签共享目录，按字段区分 |
+| `.agent/daemon_flight.lock` | 单行持有者标记（O_EXCL 原子创建） | `core.event_bus.acquire_flight_slot` | 守护进程单飞仲裁锁；崩溃残留超过 stale 阈值后可被下次启动回收 |
+| `.agent/slots/manifest.json`、`.agent/slots/slot0_<n>_<hash>.ckpt` | JSON 清单 + 二进制快照 | `core.slot_sidecar.save_slot_checkpoint`（12B） | Slot 0 循环状态磁盘黑匣子；SHA-256 校验通过后 `?action=restore` 秒级热恢复 |
+| `.agent/subagents/<sub_id>/scout_brief.json` | JSON（调研报告 + 1024 对齐锚点） | `core.subagent_runner`（12C scout 阶段） | Scout 接力交付物；Builder 依锚点分叉复用前缀缓存 |
+| `.agent/subagents/<sub_id>/verification_ticket.json` | JSON 签章（含 payload_sha256 自校验摘要） | `core.subagent_gate.generate_verification_ticket`（12C） | Verifier 确定性签章；父级据此 `--ff-only` 合并或销毁沙箱，篡改必被检出 |
 | `.agent/inbox/<时间戳>.json` | `{"message": "..."}` | CLI 操作员暂停输入 / `POST /inbox` | 操作员纠偏总线；`Agent._consume_inbox()` 每轮读取并移动到 `.agent/inbox_processed/` |
 | `.agent/screen_*.jpg` | JPEG | 截图 skill | 最近截图（上下文中仅保留少量，旧图以文字路径占位） |
 | `.agent/AGENTS.md` | Markdown | 人工维护 | **必需**的系统提示（运行规则）；agent 启动与每次构建系统提示时读取，缺失即报错，无内置默认提示 |
 | `.agent/GOAL.md` | Markdown | `--goal` 模式下由 LLM 生成 | 长期目标（可选）；goal 模式强制循环至 TASK_DONE/TASK_BLOCKED |
 | `.agent/subagents/<sub_id>/` | 目录 | `core.subagent_runner` | SubAgent 沙箱：`checkpoint.jsonl`、`status`（completed/failed/cancelled）、`artifact_card.json`（宿主生成的防篡改交付卡片） |
 | `.agent/worktrees/<sub_id>/` | Git worktree | `core.subagent_gate` | SubAgent 物理隔离工作树（分支 `subtask_<sub_id>`）；父级审查后 `--ff-only` 合并或销毁 |
-| `.agent/skills_staging/`、`.agent/skills_disabled/`、`.agent/skill_health.json` | 目录/JSON | `core.skill_sandbox` | 动态技能准入暂存区、三振隔离区与运行健康账本 |
+| `.agent/skills_staging/`、`.agent/skills_disabled/`、`.agent/skill_health.json` | 目录/JSON | `core.skill_sandbox` | 动态技能准入暂存区、三振隔离区与运行健康账本（12D 起宏条目位于其 `skills` 命名空间，三振降级为 `DEGRADED_NEEDS_HEALING`，重结晶后复位） |
 | `logs/agent.log` | 文本 | `core/logger.py` | 运行日志（CLI 与 API 同时追加写入） |
 | `logs/safety_guard.log` | 文本 | `core/tools.log_safety` | 危险命令拦截、inbox 解析失败等安全记录 |
 
@@ -223,7 +241,9 @@ curl -X POST http://127.0.0.1:8765/inbox -d '{"message":"跳过登录，直接�
 - 无鉴权、无 TLS、无多用户——本 API 面向本机可信 AI 助手；默认回环绑定。
 - 当前不引入复杂多代理网络与重型任务队列——严格保持 Single-flight 单飞与 KISS 原则，轮询文件状态即可。
 - 不做 skill 的远程市场或复杂生命周期管理——一个 skill 就是一个自描述本地 Python 脚本。
-- 不引入不可变内存树对象与复杂长驻事件总线——所有上下文与演进必须落在文件系统（详见 §13 演进路线）。
+- 不引入不可变内存树对象——所有上下文与演进必须落在文件系统。事件驱动能力由 Phase 12A 的
+  **文件基事件总线**承担：事件即 `.agent/inbox/` 明文信封，进程内没有任何隐藏队列状态
+  （详见 §13 演进路线与 §10 已决事项 8）。
 
 ---
 
@@ -236,6 +256,7 @@ curl -X POST http://127.0.0.1:8765/inbox -d '{"message":"跳过登录，直接�
 5. **保留的已知边界**：CLI 单次运行与 API 服务并发写同一任务目录属未定义行为（正常使用中不会发生：任务 id 微秒级唯一，且各自写各自目录）；git 历史中仍保留旧提交的敏感内容，推送前需按 §12 处理。
 6. **作废外部异构重构尝试（dsh）**（已决）：正式作废在外部试验目录中尝试的 TypeScript / Node.js 重构项目。原因在于其引入不可变内存树、长驻事件总线、私有编译链与异构运行环境，违背奥卡姆剃刀与极简轻量原则，造成严重心智负担与黑盒化倾向。未来所有 WebUI 与树状分支演进均基于当前 Python 原生核心（`core/` + `core/api.py`）以极简、透明、无黑盒的文件基方式演进（见 §13）。
 7. **Phase 11 认知自治四机制**（已决）：(a) 尾端锚定上下文 GC 只折叠内存投影，磁盘 DAG 永不篡改，折叠信息固化为 `[Transient Attempt Pruned: ...]` 因果徽标；(b) 1024-Token 网格对齐仅使用零语义 `\n---` 结构分隔线，严禁任何 `<!-- pad -->` 注释填充；(c) SubAgent 全程运行在 `.agent/worktrees/<id>` Git worktree 中，交付卡片客观字段由宿主从 Git 确定性计算；(d) 结晶宏主定位符严禁硬编码绝对屏幕像素，界面改版必须返回 `[MACRO_STALE_HANDOVER]` 断点热交接而非崩溃。
+8. **Phase 12 具身常驻四机制**（已决）：(a) 事件驱动文件总线：一切现实事件以明文 JSON 信封落盘 `.agent/inbox/`（优先级 0~9 全序 + 防抖合并 + processed 归档），守护进程 `run_daemon` 严格单飞（O_EXCL `daemon_flight.lock`），进程内零隐藏队列；(b) `/tokenize` 缓存为 4096 条 `OrderedDict` 有界 LRU，杜绝 7×24h 常驻内存泄漏；Slot 0 隐状态经 Sidecar 落盘（SHA-256 校验、损坏即拒绝恢复），端点拒连走 1s/2s/4s 指数退避探活并热恢复快照；(c) 工具动作按四级可逆性 Saga 代数记入只追加日志，回滚只机械补偿 Level 2，Level 3（shell、红线文件覆盖）必须产出人工确认工单、严禁静默补偿；(d) 三阶接力 Scout(只读)→Builder(强制 worktree)→Verifier(独立测试签章)，`verification_ticket.json` 带 payload 摘要防篡改，父级仅据签章 `--ff-only` 合并或销毁；结晶宏三振降级 `DEGRADED_NEEDS_HEALING`，任务收官钩子自动以愈合后主干 `overwrite=True` 重结晶并复位账本，`[MACRO_STALE_HANDOVER]` 回执为 GC 永不裁剪的物理事实。
 
 ---
 
@@ -254,6 +275,10 @@ curl -X POST http://127.0.0.1:8765/inbox -d '{"message":"跳过登录，直接�
 | `test_token_grid.py` | Phase 11B：/tokenize 精确计数与 SHA-1 缓存、离线降级、结构分隔线垫片、填充上限、压缩网格对齐、遥测状态机、DAG ckpt_aligned 元数据 |
 | `test_subagent_gate.py` | Phase 11C：Worktree 物理隔离、五类风险标记、防篡改产物卡片、merge --ff-only / revert 裁决、账本教训注入、运行器集成 |
 | `test_macro_compiler.py` | Phase 11D：污点种子提取、因果主干提纯、空间不变性、AST 纯度、沙箱干运行晋升、断点热交接、0-Token 重放 |
+| `test_event_bus.py` | Phase 12A：事件信封结构与文件名规范、优先级全序出队、同优先级 FIFO、防抖合并与过期、processed 归档、超期回收、LRU 精确淘汰与热度刷新、守护进程空闲轮询与事件消费、Level-0 紧急打断注入、单飞互斥 |
+| `test_slot_sidecar.py` | Phase 12B：save/restore HTTP 契约、清单元数据完整性、HTTP 错误平滑降级、损坏快照拒恢复、四态健康探针、Level 0/2/3 可逆性分级、Saga 日志追加与序列化、Level 2 机械补偿、Level 3 确认工单、主循环端点自愈、网格对齐快照门控 |
+| `test_subagent_relay.py` | Phase 12C：Scout 写禁令与 1024 对齐锚点、Builder 锚点继承与 worktree 物理隔离、Verifier 假绿/删断言/红线检出、签章签发与防篡改、父级合并/回滚终裁、技能 AST 纯度、端到端打桩串联、崩溃清理、接力单飞互斥 |
+| `test_macro_evolution.py` | Phase 12D：截尾上下文捕获、三振账本记分与降级、Agent 识别与自主重结晶、安全覆盖部署、账本复位、新选择器重放、全绿/失败不触发守卫、AST 纯度、并发账本安全、断点回执 GC 免剪、完整生命周期 |
 | `test_config.py` | 预算推导、`load_config()` 探测注入、上下文窗口探测（llama.cpp/OpenRouter 字段、不可达与畸形载荷回退）、环境变量覆盖与中性默认值、无默认系统提示 |
 | `test_agent.py` | 系统提示读取（`.agent/AGENTS.md` 必需、缺失即失败）、skill 契约强制与热加载、`collect_stream` 文本/推理/tool_calls 重组与断流传播、goal 模式续跑、max_rounds 终止、run_task/resume_task 的 status+checkpoint 落盘 |
 | `test_skills.py` | 对 `skills/` 全量文件的契约巡检（DESCRIPTION/PARAMETERS/HANDLER|run） |

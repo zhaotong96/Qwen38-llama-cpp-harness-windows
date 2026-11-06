@@ -23,7 +23,12 @@ docs/
 │   ├── Phase 11 架构专家验收申请任务委托书.md                # 📋 Phase 11 全量交付：架构专家终审验收申请任务委托书
 │   ├── Phase 11 架构专家验收报告.md                          # 🏆 Phase 11 领域专家终审验收裁决报告（全量 ACCEPTED）
 │   ├── ARCHITECTURE_RFC_PHASE12_EXPERT_CONSULTATION_REQUEST.md # 🚀 Phase 12: 具身常驻中枢与事件驱动自主演进专家咨询请求书
-│   └── Phase 12 架构专家咨询方案.md                          # 🌟 Phase 12: 领域专家具身常驻演进方案（形式化模型与自愈架构）
+│   ├── Phase 12 架构专家咨询方案.md                          # 🌟 Phase 12: 领域专家具身常驻演进方案（形式化模型与自愈架构）
+│   ├── Phase 12 架构专家协助调查与终审验收委托书.md          # 📋 Phase 12 全量交付：架构专家终审验收申请与协助调查委托书
+│   ├── Phase 12 架构专家终审验收报告.md                      # 🏆 Phase 12: 领域专家终审验收裁决报告（准予终审通过 Conditional Pass）
+│   ├── Phase 12 全套工程交付终审验收裁决报告.md              # 🏆 Phase 12: 项目负责人终审验收裁决报告（全量 ACCEPTED）
+│   ├── Phase 12 全量内核防御加固与生产基线专家复验申请委托书.md # 📋 Phase 12 全量内核防御加固与生产基线专家复验申请委托书
+│   └── Phase 12 内核加固复验审计.md                          # 🏆 Phase 12: 外部专家全量内核防御加固穿透式复验报告（准予生产基线固化 ACCEPTED）
 │
 ├── tasks/                  # 历史演进与生产实施任务卡片 (Checklists & Receipts)
 │   ├── TASK_DELEGATION_HYGIENE.md                           # 仓库隐私基线与敏感信息治理任务
@@ -40,7 +45,11 @@ docs/
 │   ├── TASK_DEV_PHASE11A_CONTEXT_GC.md                      # 🧠 Phase 11A 上下文尾端暂态报错自愈剪枝任务卡片
 │   ├── TASK_DEV_PHASE11B_TOKEN_GRID.md                      # 🧠 Phase 11B DeltaNet 1024-Token 网格对齐与遥测自检任务卡片
 │   ├── TASK_DEV_PHASE11C_SUBAGENT_WORKTREE.md               # 🧠 Phase 11C 子智能体 Git Worktree 隔离与对立证伪审查任务卡片
-│   └── TASK_DEV_PHASE11D_MACRO_CRYSTALLIZATION.md           # 🧠 Phase 11D 工作流宏结晶与断点热交接任务卡片
+│   ├── TASK_DEV_PHASE11D_MACRO_CRYSTALLIZATION.md           # 🧠 Phase 11D 工作流宏结晶与断点热交接任务卡片
+│   ├── TASK_DEV_PHASE12A_EVENT_BUS.md                       # 🏛️ Phase 12A 事件驱动文件总线与单飞常驻守护进程任务卡片
+│   ├── TASK_DEV_PHASE12B_SLOT_SIDECAR.md                    # 🏛️ Phase 12B 推理端点状态 Sidecar 与四级 Saga 热恢复任务卡片
+│   ├── TASK_DEV_PHASE12C_SUBAGENT_RELAY.md                  # 🏛️ Phase 12C 三阶多角色子智能体接力流水线任务卡片
+│   └── TASK_DEV_PHASE12D_MACRO_EVOLUTION.md                 # 🏛️ Phase 12D 宏技能健康度账本与自主热重结晶自愈任务卡片
 │
 ├── handover/               # 跨阶段工程交接与会话状态迁移档案 (Handovers)
 │   └── HANDOVER_PHASE10_TO_PHASE11.md                       # Phase 10 至 Phase 11 跨会话环境事实与工程交接档案
@@ -62,10 +71,14 @@ docs/
 - **[SPEC.md](SPEC.md)**：定义系统架构底座、万物皆文件持久化契约、Git 式 DAG 分支模型、ReAct 消息格式与工具分发协议，是整个仓库最权威的规格书。
 
 ### 2. 架构演进与专家咨询 (RFC)
-- **[Phase 11 架构专家终审验收报告](<rfc/Phase 11 架构专家验收报告.md>)**：🏆 领域专家终审复验裁决书，全量 ACCEPTED 通过 Phase 11 四大认知自治工程（分项评分 94~97 分）。
-- **[Phase 11 架构专家验收申请任务委托书](<rfc/Phase 11 架构专家验收申请任务委托书.md>)**：📋 项目负责人签发的专家终审验收申请，确立四大核心议题审查标准与代码地图。
+- **[Phase 12 内核加固复验审计](<rfc/Phase 12 内核加固复验审计.md>)**：🏆 领域专家针对五大安全防御加固补丁与高危代码净化工程出具的终审穿透式复验裁决书（评分 98.5，准予生产基线固化 ACCEPTED），签发 Milestone Commit 晋级许可。
+- **[Phase 12 全量内核防御加固与生产基线专家复验申请委托书](<rfc/Phase 12 全量内核防御加固与生产基线专家复验申请委托书.md>)**：📋 项目负责人针对五大防御加固补丁（纯文件心跳、二部图合成回执、Saga大文件/软链接拦截、HMAC票据防伪、宏解包与缓存失效）与高危代码彻底净化工程签发的复验申请委托书。
+- **[Phase 12 全套工程交付终审验收裁决报告](<rfc/Phase 12 全套工程交付终审验收裁决报告.md>)**：🏆 项目负责人终审复验裁决书，全量 ACCEPTED 批准通过 Phase 12 具身常驻中枢与事件驱动自主演进系统（全量 456 项测试通过）。
+- **[Phase 12 架构专家终审验收报告](<rfc/Phase 12 架构专家终审验收报告.md>)**：🏆 领域专家终审复验裁决书，准予终审通过（Conditional Pass）并签发里程碑晋级许可，附带 5 项零依赖内核级防御加固路线图。
+- **[Phase 12 架构专家协助调查与终审验收委托书](<rfc/Phase 12 架构专家协助调查与终审验收委托书.md>)**：📋 项目负责人签发的专家终审验收与协查委托书，确立四大核心协查议题、代码地图与验收标准。
 - **[Phase 12 架构专家咨询方案](<rfc/Phase 12 架构专家咨询方案.md>)**：🌟 领域专家针对 7×24h 具身常驻演进出具的权威咨询方案，涵盖截尾宏块、四级可逆 Saga、反合一聚类与座舱防偏靶。
 - **[Phase 12 架构专家咨询申请请求书](rfc/ARCHITECTURE_RFC_PHASE12_EXPERT_CONSULTATION_REQUEST.md)**：🚀 Phase 12 战略筹备期向领域专家发起的深度咨询与前沿调研请求。
+- **[Phase 11 架构专家终审验收报告](<rfc/Phase 11 架构专家验收报告.md>)**：🏆 领域专家终审复验裁决书，全量 ACCEPTED 通过 Phase 11 四大认知自治工程（分项评分 94~97 分）。
 - **[Phase 10 验收裁决书与 Phase 11 架构前瞻](<rfc/Phase 10 验收与 Phase 11 架构前瞻.md>)**：🏆 领域专家终审复验裁决书与 Phase 11 认知自治蓝图。
 - **[Phase 10 架构专家方案研究](<rfc/Phase 10 架构专家方案研究.md>)**：🌟 领域专家针对 Phase 10 与零构建 Web 演进出具的权威评审报告。
 - **[Phase 8 & 9 专家咨询备忘录](rfc/ARCHITECTURE_RFC_PHASE8_PHASE9_CONSULTATION.md)**：涵盖 AST 顶层零 Call 纯度定理、坐标系反畸变与自主因果回溯机制。

@@ -21,10 +21,17 @@ FORBIDDEN = {
     "internal network drive": "[Zz]" + r":\\[wW]ork",
     "internal nas host": "zt" + "-nas",
     "local absolute file link": "file:" + r"///[A-Za-z]:",
+    "personal email": (
+        r"\b[A-Za-z0-9._%+-]+@"
+        + r"(?!(?:[a-zA-Z0-9-]+\.)*noreply\.github\.com\b|harness\.local\b|example\.com\b|127\.0\.0\.1\b|unittest\.)"
+        + r"[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b"
+    ),
+    "unredacted google drive id": "drive" + r"\.google\.com/open\?id=(?!\[REDACTED\])[a-zA-Z0-9_\-]+",
+    "user absolute path": "[A-Za-z]:[\\\\/]" + r"[Uu]sers[\\/]zt\b|/home/" + r"zt\b",
 }
 
 SKIPPED_DIRS = {".git", "__pycache__", ".pytest_cache", "logs"}
-SKIPPED_SUFFIXES = {".pyc"}
+SKIPPED_SUFFIXES = {".pyc", ".gdoc"}
 
 
 def _is_runtime_state(rel: Path) -> bool:

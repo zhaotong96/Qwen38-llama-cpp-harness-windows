@@ -14,10 +14,12 @@ from __future__ import annotations
 
 from datetime import datetime
 import hashlib
+import hmac
 import json
 import os
 from pathlib import Path
 import re
+import secrets
 import subprocess
 from typing import Any
 
@@ -26,8 +28,13 @@ from core.models import ROOT
 from core.skill_sandbox import FROZEN_CORE_SKILLS
 from core.tools import NON_INTERACTIVE_ENV
 
+_HOST_EPHEMERAL_KEY: bytes = secrets.token_bytes(32)
+
 WORKTREES_DIRNAME = "worktrees"
 GIT_TIMEOUT = 60.0
+
+TICKET_VERIFIED = "VERIFIED_READY_TO_MERGE"
+TICKET_REJECTED = "REJECTED_VERIFICATION_FAILED"
 
 HAZARD_TEST_ASSERTION_REMOVED = "HAZARD_TEST_ASSERTION_REMOVED"
 HAZARD_TEST_SKIP_INJECTED = "HAZARD_TEST_SKIP_INJECTED"
@@ -437,3 +444,144 @@ def finalize_subagent_worktree(
         "branch_deleted": True,
         "reason": reason,
     }
+
+
+# ---------------------------------------------------------------------------
+# Phase 12C: tamper-proof verification tickets and relay finalization
+# ---------------------------------------------------------------------------
+
+def verification_ticket_path(subagent_id: str) -> Path:
+    """Disk location of the deterministic verification ticket for one relay."""
+    persistence._validate_identifier(subagent_id, "subagent id")
+    return persistence.TASKS_ROOT.parent / "subagents" / subagent_id / "verification_ticket.json"
+
+
+def _canonical_ticket_digest(ticket: dict[str, Any]) -> str:
+    """SHA-256 over the ticket's canonical JSON (sorted keys, no digest/sig field)."""
+    canonical = {k: v for k, v in ticket.items() if k not in ("payload_sha256", "signature_hmac")}
+    return hashlib.sha256(
+        json.dumps(canonical, sort_keys=True, ensure_ascii=False).encode("utf-8")
+    ).hexdigest()
+
+
+def _canonical_ticket_hmac(ticket: dict[str, Any], key: bytes = _HOST_EPHEMERAL_KEY) -> str:
+    """HMAC-SHA256 signature using the host's ephemeral memory-only key."""
+    canonical = {k: v for k, v in ticket.items() if k not in ("payload_sha256", "signature_hmac")}
+    payload_bytes = json.dumps(canonical, sort_keys=True, ensure_ascii=False).encode("utf-8")
+    return hmac.new(key, payload_bytes, hashlib.sha256).hexdigest()
+
+
+def generate_verification_ticket(
+    subagent_id: str,
+    builder_diff: str,
+    test_output: dict[str, Any],
+    hazards: list[str],
+    builder_worktree: str = "",
+    scout_anchor_node: str = "",
+    hmac_key: bytes = _HOST_EPHEMERAL_KEY,
+) -> dict[str, Any]:
+    """Deterministically issue the Verifier's tamper-proof relay ticket.
+
+    ``VERIFIED_READY_TO_MERGE`` requires a 100% green test run AND zero
+    hazard flags; anything else is force-rejected. Both canonical SHA-256
+    and host-ephemeral HMAC-SHA256 signatures are sealed into the ticket.
+    """
+    persistence._validate_identifier(subagent_id, "subagent id")
+    test_output = dict(test_output or {})
+    try:
+        exit_code = int(test_output.get("exit_code"))
+    except (TypeError, ValueError):
+        exit_code = 1
+    hazards = [str(h) for h in (hazards or [])]
+    tests_run = test_output.get("tests_run")
+    try:
+        tests_run = int(tests_run) if tests_run is not None else None
+    except (TypeError, ValueError):
+        tests_run = None
+
+    ticket: dict[str, Any] = {
+        "subagent_id": subagent_id,
+        "builder_worktree": builder_worktree or f".agent/{WORKTREES_DIRNAME}/{subagent_id}",
+        "scout_anchor_node": str(scout_anchor_node or ""),
+        "diff_sha256": hashlib.sha256((builder_diff or "").encode("utf-8")).hexdigest(),
+        "hazards_detected": hazards,
+        "test_execution": {
+            "command": str(test_output.get("command") or ""),
+            "exit_code": exit_code,
+            "tests_run": tests_run,
+            "passed": exit_code == 0,
+        },
+        "verdict": TICKET_VERIFIED if (exit_code == 0 and not hazards) else TICKET_REJECTED,
+        "verified_at": datetime.now().isoformat(timespec="microseconds"),
+    }
+    ticket["payload_sha256"] = _canonical_ticket_digest(ticket)
+    ticket["signature_hmac"] = _canonical_ticket_hmac(ticket, key=hmac_key)
+    persistence.atomic_write_text(
+        verification_ticket_path(subagent_id),
+        json.dumps(ticket, ensure_ascii=False, indent=2) + "\n",
+    )
+    return ticket
+
+
+def load_verification_ticket(subagent_id: str) -> dict[str, Any] | None:
+    """Read a persisted ticket; None when absent or unreadable."""
+    path = verification_ticket_path(subagent_id)
+    if not path.is_file():
+        return None
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def verify_ticket_integrity(ticket: dict[str, Any] | None, hmac_key: bytes = _HOST_EPHEMERAL_KEY) -> bool:
+    """True when the ticket's payload matches its recorded SHA-256 digest and HMAC signature."""
+    if not isinstance(ticket, dict) or not ticket.get("payload_sha256"):
+        return False
+    if _canonical_ticket_digest(ticket) != ticket["payload_sha256"]:
+        return False
+    sig = ticket.get("signature_hmac")
+    if not isinstance(sig, str) or not sig:
+        return False
+    expected = _canonical_ticket_hmac(ticket, key=hmac_key)
+    if not hmac.compare_digest(sig, expected):
+        return False
+    return True
+
+
+def finalize_subagent_relay(
+    subagent_id: str,
+    ticket: dict[str, Any],
+    repo_root: Path = ROOT,
+    reason: str = "",
+) -> dict[str, Any]:
+    """Execute the parent's one-click verdict from a valid verification ticket.
+
+    ``VERIFIED_READY_TO_MERGE`` → commit + ``--ff-only`` atomic merge into the
+    main workspace and sandbox destruction. Any rejected/invalid ticket →
+    destroy the sandbox unconditionally and return the causal lesson.
+    """
+    persistence._validate_identifier(subagent_id, "subagent id")
+    if not verify_ticket_integrity(ticket):
+        return {"ok": False, "error": "ticket integrity check failed (tampering detected)"}
+    verdict = str((ticket or {}).get("verdict") or "")
+    if verdict == TICKET_VERIFIED:
+        outcome = finalize_subagent_worktree(
+            subagent_id, "merge", reason or "verified relay delivery", repo_root=repo_root
+        )
+    else:
+        outcome = finalize_subagent_worktree(
+            subagent_id,
+            "revert",
+            reason or f"relay rejected: {', '.join(ticket.get('hazards_detected') or []) or 'verification failed'}",
+            repo_root=repo_root,
+        )
+        if outcome.get("ok"):
+            outcome["lesson"] = (
+                f"[Branch Rewind Lesson] (Relay '{subagent_id}' rejected: {verdict}) "
+                "sandbox destroyed; delivery never reached the main workspace."
+            )
+    if outcome.get("ok"):
+        outcome["verdict"] = verdict
+    return outcome

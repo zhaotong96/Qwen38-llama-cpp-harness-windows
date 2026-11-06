@@ -37,6 +37,12 @@ _PROTECTED_MARKERS = (
     "[EXECUTION_INTERRUPTED",
     "[Branch Rewind Lesson]",
     "<immutable_redlines>",
+    # Phase 12D: the stale-macro handover receipt is a physical fact (which
+    # steps already ran on screen) and the auto re-crystallization hook keys
+    # on it; folding it away would break the healing loop.
+    "[MACRO_STALE_HANDOVER]",
+    # Phase 12A-2: emergency abort synthetic receipt must never be pruned as transient trial.
+    "ABORTED_BY_LEVEL0_EMERGENCY",
 )
 
 _EXCEPTION_RE = re.compile(

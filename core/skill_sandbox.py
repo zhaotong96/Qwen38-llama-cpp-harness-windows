@@ -40,8 +40,8 @@ FROZEN_CORE_SKILLS = frozenset({
     "add_skill", "branch_rewind", "chat_with_web_llm", "chrome_dom", "clipboard",
     "crystallize_macro", "git", "grounding", "keyboard", "list_dir", "modify_skill",
     "mouse", "patch", "pic_zoom", "read_checkpoint_node", "read_file", "read_skill",
-    "screenshot", "search", "shell", "subagent", "subagent_review", "task_blocked",
-    "task_done", "ui_tree", "window_manager", "write_file",
+    "screenshot", "search", "shell", "subagent", "subagent_relay", "subagent_review",
+    "task_blocked", "task_done", "ui_tree", "window_manager", "write_file",
 })
 
 ALLOWED_EXTERNAL_PACKAGES = frozenset({"openai", "mss", "PIL", "websocket"})
@@ -404,6 +404,14 @@ def verify_and_deploy_skill(skill_name: str, code: str, overwrite: bool = False)
 
     persistence.atomic_write_text(target_path, code)
     reset_skill_failures(name)
+    try:
+        import importlib
+        importlib.invalidate_caches()
+        module_key = f"skills.{name}"
+        if module_key in sys.modules:
+            del sys.modules[module_key]
+    except Exception:
+        pass
     action_word = "updated" if overwrite else "created"
     return f"{action_word} skill {target_path.name} (passed AST, Schema, and Dry-Run sandbox gates)"
 
@@ -500,3 +508,93 @@ def reset_skill_failures(skill_name: str) -> None:
         if skill_name in data:
             data.pop(skill_name, None)
             _save_health(data)
+
+
+# ---------------------------------------------------------------------------
+# Phase 12D: macro health three-strike ledger (.agent/skill_health.json)
+# ---------------------------------------------------------------------------
+
+MACRO_HEALTH_NAMESPACE = "skills"
+MACRO_DEGRADED_THRESHOLD = 3
+MACRO_STATUS_HEALTHY = "HEALTHY"
+MACRO_STATUS_DEGRADED = "DEGRADED_NEEDS_HEALING"
+MACRO_FAILURE_HISTORY_CAP = 10
+
+
+def _macro_entries(data: dict[str, Any]) -> dict[str, Any]:
+    entries = data.get(MACRO_HEALTH_NAMESPACE)
+    return entries if isinstance(entries, dict) else {}
+
+
+def _default_macro_entry() -> dict[str, Any]:
+    return {
+        "status": MACRO_STATUS_HEALTHY,
+        "consecutive_failures": 0,
+        "total_executions": 0,
+        "failure_history": [],
+    }
+
+
+def record_macro_execution_result(
+    macro_name: str, success: bool, failure_step: int | None = None
+) -> dict[str, Any]:
+    """Feed one macro replay outcome into the three-strike health ledger.
+
+    Success zeroes ``consecutive_failures`` and restores ``HEALTHY``; the
+    third consecutive failure marks the macro ``DEGRADED_NEEDS_HEALING`` so
+    the agent knows a re-crystallization pass is due. Writes are serialized
+    under the shared health lock for concurrent macro executions.
+    """
+    name = str(macro_name or "").strip()
+    if not name:
+        raise ValueError("macro_name must be a non-empty string")
+    with _HEALTH_LOCK:
+        data = _load_health()
+        entries = _macro_entries(data)
+        entry = entries.get(name)
+        entry = dict(entry) if isinstance(entry, dict) else _default_macro_entry()
+        entry["total_executions"] = int(entry.get("total_executions") or 0) + 1
+        entry["last_executed_at"] = datetime.now().isoformat(timespec="microseconds")
+        if success:
+            entry["consecutive_failures"] = 0
+            entry["status"] = MACRO_STATUS_HEALTHY
+        else:
+            entry["consecutive_failures"] = int(entry.get("consecutive_failures") or 0) + 1
+            history = [h for h in (entry.get("failure_history") or []) if isinstance(h, dict)]
+            history.append({"at": entry["last_executed_at"], "step": failure_step})
+            entry["failure_history"] = history[-MACRO_FAILURE_HISTORY_CAP:]
+            if entry["consecutive_failures"] >= MACRO_DEGRADED_THRESHOLD:
+                entry["status"] = MACRO_STATUS_DEGRADED
+        entries[name] = entry
+        data[MACRO_HEALTH_NAMESPACE] = entries
+        _save_health(data)
+        return dict(entry)
+
+
+def reset_macro_health(macro_name: str) -> None:
+    """Clear the failure counter and degraded flag after a re-crystallization."""
+    name = str(macro_name or "").strip()
+    if not name:
+        return
+    with _HEALTH_LOCK:
+        data = _load_health()
+        entries = _macro_entries(data)
+        previous = entries.get(name) if isinstance(entries.get(name), dict) else {}
+        entries[name] = {
+            "status": MACRO_STATUS_HEALTHY,
+            "consecutive_failures": 0,
+            "total_executions": int(previous.get("total_executions") or 0),
+            "last_executed_at": previous.get("last_executed_at"),
+            "last_healed_at": datetime.now().isoformat(timespec="microseconds"),
+            "failure_history": [],
+        }
+        data[MACRO_HEALTH_NAMESPACE] = entries
+        _save_health(data)
+
+
+def get_macro_health(macro_name: str) -> dict[str, Any]:
+    """Return the ledger entry for one macro (defaults when never executed)."""
+    with _HEALTH_LOCK:
+        entries = _macro_entries(_load_health())
+        entry = entries.get(str(macro_name or "").strip())
+    return dict(entry) if isinstance(entry, dict) else _default_macro_entry()

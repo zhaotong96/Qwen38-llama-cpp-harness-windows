@@ -21,17 +21,22 @@ import hashlib
 import json
 import urllib.error
 import urllib.request
+from collections import OrderedDict
 from typing import Any
 
 GRID_STEP = 1024
 MAX_PAD_TOKENS = 64
 TOKENIZE_TIMEOUT = 0.3
 
+# Phase 12A: bounded LRU memoization — a 7x24h resident daemon must never grow
+# this cache without limit. 4096 SHA-1 keys are ample for live context reuse.
+MAX_TOKEN_CACHE_SIZE = 4096
+
 # Structural divider shim: in the Qwen vocabulary each "\n---" line encodes as
 # ~2 format-only tokens and carries no semantic bias. Never use comment pads.
 _PAD_LINE = "---"
 
-_TOKEN_CACHE: dict[str, int] = {}
+_TOKEN_CACHE: "OrderedDict[str, int]" = OrderedDict()
 
 
 def _is_cjk(char: str) -> bool:
@@ -99,6 +104,7 @@ def exact_or_estimated_tokens(
     key = hashlib.sha1(text.encode("utf-8", errors="replace")).hexdigest()
     cached = _TOKEN_CACHE.get(key)
     if cached is not None:
+        _TOKEN_CACHE.move_to_end(key)
         return cached
 
     count: int | None = None
@@ -107,6 +113,8 @@ def exact_or_estimated_tokens(
     if count is None:
         count = estimate_text_tokens(text)
     _TOKEN_CACHE[key] = count
+    while len(_TOKEN_CACHE) > MAX_TOKEN_CACHE_SIZE:
+        _TOKEN_CACHE.popitem(last=False)
     return count
 
 

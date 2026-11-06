@@ -27,6 +27,7 @@ from core.interrupt import (
     consume_step_continue,
     get_step_mode,
     is_step_rejected,
+    set_abort_flag,
     wait_for_step_continue,
     write_step_state,
 )
@@ -40,7 +41,11 @@ from core.models import (
     SCREEN_PATH,
 )
 from core import persistence
+from core import macro_compiler
+from core import saga_compensator
 from core import skill_sandbox
+from core import slot_sidecar
+from core import event_bus
 from core.persistence import (
     append_stream_event,
     generate_task_id,
@@ -211,6 +216,9 @@ class Agent:
         # short post-rewind window where repetition loops trigger a reseed.
         self._force_cache_reset = False
         self._post_branch_switch_rounds = 0
+        # Phase 12B slot sidecar: the highest 1024-grid index already frozen
+        # to disk, so each grid line snapshots exactly once per session.
+        self._last_slot_snapshot_grid_index = 0
 
     def _init_role_clients(self) -> None:
         """Initialize optional tiered compactor client when configured."""
@@ -459,6 +467,10 @@ class Agent:
         for p in sorted(INBOX.glob("*.json")):
             try:
                 data = json.loads(p.read_text(encoding="utf-8"))
+                if event_bus.is_event_envelope_data(data):
+                    # Phase 12A: event envelopes belong to the event bus daemon,
+                    # never to the legacy operator-note protocol.
+                    continue
                 text = str(data.get("message", "")).strip()
                 if text:
                     notes.append(text)
@@ -495,6 +507,200 @@ class Agent:
 
         return notes
 
+    def _check_event_bus_emergency(self) -> dict[str, Any] | None:
+        """Phase 12A: consume a Level-0 emergency envelope via the abort-gate.
+
+        When a ``priority == 0`` envelope carrying ``abort_current=True`` waits
+        in the event bus, it is dequeued immediately and routed through the
+        existing abort-gate mechanism (abort.flag), so the current ReAct round
+        stops at the next gate boundary with a safe on-disk checkpoint.
+        """
+        peeked = event_bus.peek_highest_priority_event()
+        if peeked is None or int(peeked.get("priority", 9)) != 0:
+            return None
+        payload = peeked.get("payload") or {}
+        if not payload.get("abort_current"):
+            return None
+        consumed = event_bus.pop_highest_priority_event() or peeked
+        reason = str(
+            payload.get("directive")
+            or f"Emergency event {consumed.get('event_type', '')} requested an abort"
+        )
+        if self.current_task_id:
+            set_abort_flag(
+                self.current_task_id,
+                source="event_bus",
+                reason=reason,
+                mode="reject_execution",
+                halt_loop=True,
+                base_root=self._tasks_root,
+            )
+            self._ensure_bipartite_tool_pairing()
+            self.observer.emit(
+                self.current_task_id,
+                "emergency_abort",
+                {"event_id": consumed.get("event_id"), "reason": reason},
+                step_id=self._active_step_id,
+                tasks_root=self._tasks_root,
+            )
+            self.logger.warning(f"[event-bus] Level-0 emergency abort injected: {reason}")
+            return {"source": "event_bus", "reason": reason, "halt_loop": True}
+        return None
+
+    def _ensure_bipartite_tool_pairing(self) -> None:
+        """Patch-12A-2: Inject synthetic receipts for unclosed tool_calls before checkpointing.
+
+        Ensures strict bipartite pairing between assistant.tool_calls and tool receipts
+        so the OpenAI ChatML message topology and 1024-token grid boundary remain unbroken
+        even if a batch of tools was interrupted mid-flight.
+        """
+        try:
+            messages = self.context.as_list()
+        except Exception:
+            return
+        if not messages:
+            return
+
+        last_asst_idx = -1
+        for idx in range(len(messages) - 1, -1, -1):
+            item = messages[idx]
+            if item.get("role") == "assistant" and item.get("tool_calls"):
+                last_asst_idx = idx
+                break
+            if item.get("role") == "user":
+                break
+
+        if last_asst_idx == -1:
+            return
+
+        asst_msg = messages[last_asst_idx]
+        tool_calls = asst_msg.get("tool_calls") or []
+        existing_receipt_ids = {
+            m.get("tool_call_id")
+            for m in messages[last_asst_idx + 1:]
+            if m.get("role") == "tool" and m.get("tool_call_id")
+        }
+
+        unpaired = [tc for tc in tool_calls if tc.get("id") and tc.get("id") not in existing_receipt_ids]
+        if not unpaired:
+            return
+
+        for tc in unpaired:
+            tc_id = tc["id"]
+            fn_name = (tc.get("function") or {}).get("name", "unknown")
+            synthetic_content = json.dumps(
+                {
+                    "ok": False,
+                    "status": "ABORTED_BY_LEVEL0_EMERGENCY",
+                    "tool": fn_name,
+                    "message": f"Tool '{fn_name}' execution was aborted before invocation due to emergency interrupt.",
+                },
+                ensure_ascii=False,
+            )
+            synthetic_receipt = {
+                "role": "tool",
+                "tool_call_id": tc_id,
+                "content": synthetic_content,
+            }
+            with self._scoped_persistence():
+                self.context.append(
+                    synthetic_receipt,
+                    meta={"step_id": self._active_step_id, "aborted_synthetic": True},
+                )
+
+    # ------------------------------------------------------------------
+    # Phase 12D: macro health ledger + autonomous re-crystallization
+    # ------------------------------------------------------------------
+
+    _MACRO_STALE_MARKER = "[MACRO_STALE_HANDOVER]"
+    _MACRO_NAME_RE = re.compile(r'"macro_name"\s*:\s*"([^"]+)"')
+
+    def _record_macro_outcome(self, macro_name: str, result_text: Any) -> None:
+        """Feed one macro replay outcome into the three-strike health ledger."""
+        try:
+            text = str(result_text or "")
+            if "MACRO_STALE_AT_STEP" in text:
+                payload: dict[str, Any] = {}
+                try:
+                    payload = json.loads(text)
+                except Exception:
+                    payload = {}
+                skill_sandbox.record_macro_execution_result(
+                    macro_name,
+                    success=False,
+                    failure_step=payload.get("failed_step_index"),
+                )
+            elif "MACRO_COMPLETED_ZERO_TOKEN" in text:
+                skill_sandbox.record_macro_execution_result(macro_name, success=True)
+        except Exception as exc:
+            self.logger.warning(f"[macro-evolution] health ledger update failed: {exc}")
+
+    def _find_stale_macro_name(self) -> str:
+        """Identify the macro that triggered a stale handover on this branch."""
+        if not self.current_task_id:
+            return ""
+        with self._scoped_persistence():
+            chain = persistence.build_branch_nodes(
+                self.current_task_id, self.context.branch
+            )
+        for node in reversed(chain):
+            content = node.get("content")
+            if not isinstance(content, str) or self._MACRO_STALE_MARKER not in content:
+                continue
+            match = self._MACRO_NAME_RE.search(content)
+            if match:
+                candidate = match.group(1).strip()
+                if candidate.startswith("macro_"):
+                    return candidate
+        return ""
+
+    def _maybe_autorecrystallize_stale_macro(self) -> str:
+        """Heal a stale macro after the model completed the takeover (TASK_DONE).
+
+        Re-compiles the winning (healed) spine over the old macro with
+        ``overwrite=True``, resets the three-strike health ledger, and returns
+        the ``[AUTONOMOUS_HEALING]`` note for the final task summary.
+        """
+        macro_name = self._find_stale_macro_name()
+        if not macro_name:
+            return ""
+        description = ""
+        try:
+            import importlib
+
+            module = importlib.import_module(f"skills.{macro_name}")
+            description = str(getattr(module, "DESCRIPTION", "") or "")
+        except Exception:
+            description = ""
+        if not description.strip():
+            description = f"Healed crystallized desktop workflow ({macro_name})."
+
+        with self._scoped_persistence():
+            result = macro_compiler.compile_and_deploy_macro(
+                self.current_task_id,
+                macro_name,
+                description,
+                branch=self.context.branch,
+                overwrite=True,
+            )
+        if not str(result).startswith("updated skill"):
+            self.logger.warning(f"[macro-evolution] auto re-crystallization failed: {result}")
+            return ""
+        try:
+            self.reload_skills()
+        except Exception as reload_err:
+            self.logger.warning(f"[macro-evolution] skill reload failed: {reload_err}")
+        try:
+            skill_sandbox.reset_macro_health(macro_name)
+        except Exception as reset_err:
+            self.logger.warning(f"[macro-evolution] health reset failed: {reset_err}")
+        note = (
+            f"[AUTONOMOUS_HEALING] Macro '{macro_name}' was successfully "
+            "re-crystallized with updated UI selectors."
+        )
+        self.logger.info(f"[macro-evolution] {note}")
+        return note
+
     def _adaptive_read_timeout(self) -> float:
         """Scale the HTTP read timeout with the live context size.
 
@@ -503,6 +709,71 @@ class Agent:
         interactions from being cut off as false failures.
         """
         return self.READ_TIMEOUT_BASE + self.context.token_estimate() / self.READ_TIMEOUT_TOKENS_PER_SECOND
+
+    def _maybe_save_slot_snapshot(self, report: dict[str, Any]) -> None:
+        """Phase 12B: freeze Slot 0 when the prefix sits exactly on a grid line.
+
+        The snapshot is only taken at a RESONANT telemetry audit with a prefix
+        that is a strict multiple of the 1024 grid step, and only once per
+        grid line per session — anything else would waste disk I/O or capture
+        a mid-block state that no future request can legally resume from.
+        """
+        prefix = int(report.get("expected_prefix_tokens") or 0)
+        if prefix < token_grid.GRID_STEP or prefix % token_grid.GRID_STEP != 0:
+            return
+        grid_index = prefix // token_grid.GRID_STEP
+        if grid_index <= self._last_slot_snapshot_grid_index:
+            return
+        try:
+            prefix_text = str(self.context.as_list()[0].get("content") or "")
+            result = slot_sidecar.save_slot_checkpoint(
+                self.config.base_url,
+                slot_id=0,
+                aligned_tokens=prefix,
+                prefix_text=prefix_text,
+            )
+        except Exception as exc:
+            self.logger.warning(f"[slot-sidecar] snapshot failed: {exc}")
+            return
+        self._last_slot_snapshot_grid_index = grid_index
+        if result.get("ok"):
+            self.logger.info(
+                f"[slot-sidecar] slot 0 frozen at grid line {prefix} "
+                f"({result.get('manifest', {}).get('ckpt_filename', '')})"
+            )
+        else:
+            self.logger.info(
+                f"[slot-sidecar] endpoint without slot persistence; skipped ({result.get('detail', '')[:120]})"
+            )
+
+    def _heal_endpoint_after_refusal(self) -> bool:
+        """Phase 12B: reconnect to a refused endpoint and restore Slot 0.
+
+        Runs the exponential-backoff probe schedule (1s/2s/4s); when the host
+        answers again, the persisted Slot 0 checkpoint is hot-restored so the
+        next request reuses its aligned prefix cache instead of re-prefilling.
+        """
+        try:
+            report = slot_sidecar.wait_for_endpoint_recovery(self.config.base_url)
+        except Exception as exc:
+            self.logger.warning(f"[slot-sidecar] heal probe failed: {exc}")
+            return False
+        if not report.get("recovered"):
+            self.logger.warning(
+                f"[slot-sidecar] endpoint still unreachable after backoff: {report.get('status')}"
+            )
+            return False
+        self.logger.warning("[slot-sidecar] endpoint recovered; restoring slot 0 checkpoint")
+        try:
+            restored = slot_sidecar.restore_slot_checkpoint(self.config.base_url, 0)
+        except Exception as exc:
+            self.logger.warning(f"[slot-sidecar] restore failed: {exc}")
+            return False
+        if restored:
+            self.logger.info("[slot-sidecar] slot 0 checkpoint hot-restored")
+        else:
+            self.logger.info("[slot-sidecar] no verifiable checkpoint to restore; continuing cold")
+        return True
 
     def _audit_checkpoint_telemetry(self, resp: Any) -> None:
         """Phase 11B: audit llama-server cache telemetry against the grid.
@@ -533,6 +804,7 @@ class Agent:
                 f"[token-grid] cache_n={report['cache_n']} status=RESONANT "
                 f"prefix~{report['expected_prefix_tokens']} tokens"
             )
+            self._maybe_save_slot_snapshot(report)
         else:
             self.logger.warning(
                 f"[token-grid] cache_n={report['cache_n']} status={status} "
@@ -583,6 +855,13 @@ class Agent:
                     self.context._refresh_screenshot_indices()
                     self.logger.warning(f"vision unsupported on server — stripped {n} image(s), retry")
                     return self.client.chat.completions.create(**kwargs)
+                if any(x in err for x in ("10061", "actively refused", "connection refused")):
+                    # Phase 12B: endpoint self-healing on transient refusal.
+                    # Probe with exponential backoff, then hot-restore the
+                    # Slot 0 sidecar checkpoint before retrying the request.
+                    self.logger.warning(f"[slot-sidecar] endpoint refusal; entering self-healing: {e}")
+                    self._heal_endpoint_after_refusal()
+                    continue
                 if any(x in err for x in ("503", "loading model", "unavailable", "connection", "timeout", "502", "504")):
                     wait = min(60, 5 * attempt)
                     self.logger.warning(f"LLM busy/503 attempt {attempt}/8 — sleep {wait}s: {e}")
@@ -961,6 +1240,10 @@ class Agent:
                 with self._scoped_persistence():
                     self.context.append({"role": "user", "content": f"[Operator correction]\n{note}"})
 
+            # Phase 12A: event-bus emergency interrupt (Level 0). Routed through
+            # the existing abort-gate so the checkpoint machinery stays intact.
+            self._check_event_bus_emergency()
+
             # Check if an abort flag was already placed before decoding starts
             pre_round_abort = self._is_step_rejected()
             if pre_round_abort and pre_round_abort.get("halt_loop"):
@@ -1232,6 +1515,16 @@ class Agent:
                         tasks_root=self._tasks_root,
                     )
 
+                    # Phase 12B: Saga reversibility journal — classify the
+                    # action and snapshot the pre-state of compensable writes
+                    # before dispatch, so a crash rollback can restore them.
+                    saga_level = saga_compensator.classify_action_reversibility(name, args)
+                    saga_before_state = (
+                        saga_compensator.capture_action_before_state(name, args)
+                        if saga_level >= saga_compensator.LEVEL_COMPENSABLE
+                        else None
+                    )
+
                     set_active_execution_context(
                         self.current_task_id,
                         base_root=self._tasks_root,
@@ -1258,6 +1551,26 @@ class Agent:
                             and result_text.lstrip().lower().startswith("error")
                         ):
                             handler_failed = True
+                        if (
+                            not handler_failed
+                            and saga_level >= saga_compensator.LEVEL_COMPENSABLE
+                            and self.current_task_id
+                        ):
+                            try:
+                                saga_compensator.record_action_journal(
+                                    self.current_task_id,
+                                    step_index=round_i,
+                                    tool_name=name,
+                                    args=args,
+                                    before_state=saga_before_state,
+                                )
+                            except Exception as journal_err:
+                                self.logger.warning(
+                                    f"[saga] journal record failed: {journal_err}"
+                                )
+                        if name.startswith("macro_"):
+                            # Phase 12D: three-strike macro health ledger.
+                            self._record_macro_outcome(name, result_text)
                         quarantine_note = None
                         try:
                             quarantine_note = skill_sandbox.record_skill_outcome(
@@ -1478,6 +1791,18 @@ class Agent:
                         self.context.append({"role": "user", "content": gate_msg})
                     continue
 
+                # Phase 12D: the model just completed the visual-semantic
+                # takeover after a stale-macro handover — re-crystallize the
+                # healed spine over the old macro and reset its ledger.
+                healing_note = self._maybe_autorecrystallize_stale_macro()
+                if healing_note:
+                    with self._scoped_persistence():
+                        self.context.append(
+                            {"role": "assistant", "content": healing_note},
+                            meta={"step_id": step_id, "autonomous_healing": True},
+                        )
+                    last = f"{last}\n\n{healing_note}"
+
             return last
 
         return last or "TASK_BLOCKED: max rounds reached"
@@ -1615,6 +1940,7 @@ class Agent:
         finally:
             with self._scoped_persistence():
                 try:
+                    self._ensure_bipartite_tool_pairing()
                     save_checkpoint(task_id, self.context.as_list())
                 except Exception as e:
                     self.logger.error(f"Checkpoint save failed: {e}")
@@ -1628,6 +1954,102 @@ class Agent:
         elif "TASK_BLOCKED" in final:
             self.logger.info("[blocked]")
         return final
+
+    # ------------------------------------------------------------------
+    # Phase 12A: resident event-driven daemon (single-flight)
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _event_dispatch_prompt(event: dict[str, Any]) -> str:
+        """Render one dequeued event envelope into a runnable task prompt."""
+        payload = event.get("payload") or {}
+        directive = str(
+            payload.get("directive") or payload.get("message") or payload.get("task") or ""
+        ).strip()
+        if not directive:
+            directive = (
+                f"[{event.get('event_type', 'EVENT')}] event triggered; "
+                "handle it with the available tools and report the outcome."
+            )
+        return (
+            f"[EventBus Dispatch] source={event.get('source', 'system')} "
+            f"type={event.get('event_type', 'EVENT')} "
+            f"priority={event.get('priority', 3)}\n{directive}"
+        )
+
+    def _emit_daemon_phase(self, phase: str, detail: Any) -> None:
+        self.observer.emit(
+            self.current_task_id,
+            "daemon_phase",
+            {"phase": phase, "detail": detail},
+            step_id="daemon",
+            tasks_root=self._tasks_root,
+        )
+
+    def run_daemon(
+        self,
+        poll_interval: float = 0.5,
+        max_idle_seconds: float | None = None,
+        max_events: int | None = None,
+        stale_lock_seconds: float = 21600.0,
+    ) -> None:
+        """Resident 7x24h daemon loop over the ``.agent/inbox/`` event bus.
+
+        State machine: IDLE_WAITING → PRIORITY_DEQUEUE → TASK_DISPATCH →
+        STEP_LOOP_EXECUTION (one ``run_task``) → POST_TASK_CHECKPOINT → back to
+        idle. The single-flight red line is enforced by the O_EXCL
+        ``daemon_flight.lock``: the slot is held for the whole dispatch span,
+        so a second daemon (or process) can never run a second task
+        concurrently. A leftover lock from a crashed daemon is only broken at
+        startup when it is older than ``stale_lock_seconds``.
+        """
+        marker = f"{os.getpid()}:{time.time_ns()}"
+        event_bus.break_stale_flight_lock(max_age_seconds=float(stale_lock_seconds))
+        idle_seconds = 0.0
+        dispatched = 0
+        self.logger.info("[daemon] resident loop started (single-flight enforced)")
+        while True:
+            if max_events is not None and dispatched >= max_events:
+                self.logger.info(f"[daemon] max_events={max_events} reached; exiting")
+                return
+            if max_idle_seconds is not None and idle_seconds >= max_idle_seconds:
+                self.logger.info("[daemon] idle budget exhausted; exiting")
+                return
+
+            if not event_bus.acquire_flight_slot(marker):
+                # IDLE_WAITING standby: another dispatcher owns the flight slot.
+                self._emit_daemon_phase(
+                    "IDLE_WAITING", {"standby": "single-flight slot held"}
+                )
+                idle_seconds += poll_interval
+                time.sleep(poll_interval)
+                continue
+            try:
+                event = event_bus.pop_highest_priority_event()
+                if event is None:
+                    self._emit_daemon_phase("IDLE_WAITING", None)
+                    idle_seconds += poll_interval
+                    time.sleep(poll_interval)
+                    continue
+                self._emit_daemon_phase("PRIORITY_DEQUEUE", event)
+                event_bus.touch_flight_slot(marker)
+                prompt = self._event_dispatch_prompt(event)
+                self._emit_daemon_phase("TASK_DISPATCH", event)
+                try:
+                    event_bus.touch_flight_slot(marker)
+                    final = self.run_task(prompt)
+                except Exception as exc:  # a dispatch must never kill the loop
+                    self.logger.error(f"[daemon] dispatch failed: {exc}")
+                    final = f"TASK_BLOCKED: daemon dispatch failed: {exc}"
+                finally:
+                    event_bus.touch_flight_slot(marker)
+                dispatched += 1
+                self._emit_daemon_phase(
+                    "POST_TASK_CHECKPOINT",
+                    {"event_id": event.get("event_id"), "final": str(final)[:200]},
+                )
+            finally:
+                event_bus.release_flight_slot(marker)
 
     def run(self, user_text: str) -> str:
         return self.run_task(user_text)
